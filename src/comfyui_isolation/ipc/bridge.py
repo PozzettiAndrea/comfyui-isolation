@@ -163,6 +163,9 @@ class WorkerBridge:
                 bufsize=1,  # Line buffered
             )
 
+            # Collect stderr for error reporting
+            self._stderr_lines = []
+
             # Start stderr reader thread
             self._stderr_thread = threading.Thread(
                 target=self._read_stderr,
@@ -171,6 +174,20 @@ class WorkerBridge:
             )
             self._stderr_thread.start()
 
+            # Give the process a moment to crash if it's going to (e.g., import error)
+            import time
+            time.sleep(0.5)
+
+            # Check if process died immediately
+            if self._process.poll() is not None:
+                exit_code = self._process.returncode
+                time.sleep(0.2)  # Let stderr thread collect output
+                stderr_output = "\n".join(self._stderr_lines[-20:])  # Last 20 lines
+                raise RuntimeError(
+                    f"Worker crashed on startup (exit code {exit_code}).\n"
+                    f"Stderr output:\n{stderr_output}"
+                )
+
             # Test connection
             try:
                 response = self._send_raw({"method": "ping"}, timeout=30.0)
@@ -178,8 +195,11 @@ class WorkerBridge:
                     raise RuntimeError(f"Worker ping failed: {response}")
                 self.log("Worker started successfully")
             except Exception as e:
+                # Collect any stderr output for debugging
+                time.sleep(0.2)
+                stderr_output = "\n".join(self._stderr_lines[-20:])
                 self.stop()
-                raise RuntimeError(f"Worker failed to start: {e}")
+                raise RuntimeError(f"Worker failed to start: {e}\nStderr:\n{stderr_output}")
 
     def _read_stderr(self) -> None:
         """Read stderr from worker and forward to log callback."""
@@ -190,6 +210,9 @@ class WorkerBridge:
             line = line.rstrip()
             if line:
                 self.log(line)
+                # Also collect for error reporting
+                if hasattr(self, '_stderr_lines'):
+                    self._stderr_lines.append(line)
 
     def stop(self) -> None:
         """
