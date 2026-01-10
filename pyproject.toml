@@ -18,7 +18,9 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
-dependencies = []
+dependencies = [
+    "tomli>=2.0.0; python_version < '3.11'",  # TOML parsing (built-in tomllib for 3.11+)
+]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff", "mypy"]

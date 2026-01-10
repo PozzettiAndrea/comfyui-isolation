@@ -2,6 +2,10 @@
 Example ComfyUI node that uses process isolation.
 
 This demonstrates how to use comfyui-isolation in a ComfyUI custom node.
+
+Two approaches are shown:
+1. Programmatic configuration (IsolatedEnv directly in code)
+2. Declarative configuration (comfyui_isolation_reqs.toml file)
 """
 
 from pathlib import Path
@@ -11,7 +15,10 @@ from comfyui_isolation import IsolatedEnv, WorkerBridge, detect_cuda_version
 NODE_ROOT = Path(__file__).parent
 
 
-# Define the isolated environment configuration
+# ===========================================================================
+# APPROACH 1: Programmatic Configuration (traditional)
+# ===========================================================================
+# Define the isolated environment configuration in code
 ENV_CONFIG = IsolatedEnv(
     name="example-node",
     python="3.10",
@@ -31,7 +38,7 @@ _bridge = None
 
 
 def get_bridge() -> WorkerBridge:
-    """Get or create the worker bridge singleton."""
+    """Get or create the worker bridge singleton (programmatic approach)."""
     global _bridge
     if _bridge is None:
         _bridge = WorkerBridge(
@@ -40,6 +47,25 @@ def get_bridge() -> WorkerBridge:
             base_dir=NODE_ROOT,
         )
     return _bridge
+
+
+# ===========================================================================
+# APPROACH 2: Declarative Configuration (recommended for new projects)
+# ===========================================================================
+# Instead of the above, you can use a comfyui_isolation_reqs.toml file:
+#
+# def get_bridge() -> WorkerBridge:
+#     """Get or create the worker bridge singleton (config file approach)."""
+#     global _bridge
+#     if _bridge is None:
+#         _bridge = WorkerBridge.from_config_file(
+#             node_dir=NODE_ROOT,
+#             worker_script=NODE_ROOT / "worker.py",
+#         )
+#     return _bridge
+#
+# This auto-discovers comfyui_isolation_reqs.toml in the node directory.
+# See the example file in this directory for the format.
 
 
 class IsolatedProcessorNode:

@@ -113,6 +113,71 @@ class WorkerBridge:
                 )
             return cls._instances[env_hash]
 
+    @classmethod
+    def from_config_file(
+        cls,
+        node_dir: Path,
+        worker_script: Path,
+        config_file: Optional[str] = None,
+        log_callback: Optional[Callable[[str], None]] = None,
+        auto_start: bool = True,
+    ) -> "WorkerBridge":
+        """
+        Create WorkerBridge from a config file.
+
+        This is a convenience method for loading environment configuration
+        from a TOML file instead of defining it programmatically.
+
+        Args:
+            node_dir: Directory containing the config file (and base_dir for env)
+            worker_script: Path to worker script
+            config_file: Specific config file name (default: auto-discover)
+            log_callback: Optional callback for logging
+            auto_start: Whether to auto-start worker on first call (default: True)
+
+        Returns:
+            Configured WorkerBridge instance
+
+        Raises:
+            FileNotFoundError: If no config file found
+            ImportError: If tomli not installed (Python < 3.11)
+
+        Example:
+            # Auto-discover config file
+            bridge = WorkerBridge.from_config_file(
+                node_dir=Path(__file__).parent,
+                worker_script=Path(__file__).parent / "worker.py",
+            )
+
+            # Specify config file explicitly
+            bridge = WorkerBridge.from_config_file(
+                node_dir=Path(__file__).parent,
+                worker_script=Path(__file__).parent / "worker.py",
+                config_file="my_config.toml",
+            )
+        """
+        from ..env.config_file import load_env_from_file, discover_env_config, CONFIG_FILE_NAMES
+
+        node_dir = Path(node_dir)
+
+        if config_file:
+            env = load_env_from_file(node_dir / config_file, node_dir)
+        else:
+            env = discover_env_config(node_dir)
+            if env is None:
+                raise FileNotFoundError(
+                    f"No isolation config found in {node_dir}. "
+                    f"Create one of: {', '.join(CONFIG_FILE_NAMES)}"
+                )
+
+        return cls(
+            env=env,
+            worker_script=worker_script,
+            base_dir=node_dir,
+            log_callback=log_callback,
+            auto_start=auto_start,
+        )
+
     @property
     def python_exe(self) -> Path:
         """Get the Python executable path for the isolated environment."""

@@ -30,6 +30,11 @@ Example usage:
 __version__ = "0.1.0"
 
 from .env.config import IsolatedEnv
+from .env.config_file import (
+    load_env_from_file,
+    discover_env_config,
+    CONFIG_FILE_NAMES,
+)
 from .env.manager import IsolatedEnvManager
 from .env.detection import detect_cuda_version, detect_gpu_info, get_gpu_summary
 from .env.security import (
@@ -53,6 +58,10 @@ __all__ = [
     # Environment
     "IsolatedEnv",
     "IsolatedEnvManager",
+    # Config file loading
+    "load_env_from_file",
+    "discover_env_config",
+    "CONFIG_FILE_NAMES",
     # Detection
     "detect_cuda_version",
     "detect_gpu_info",
