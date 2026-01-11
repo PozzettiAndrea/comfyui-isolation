@@ -122,10 +122,8 @@ def isolated(
             node_package_dir = node_dir
 
         # Determine the module path for importing in subprocess
-        # e.g., "nodes.depth_estimate" or just "depth_estimate"
+        # Just use the file stem - node_dir is added to sys.path
         module_name = source_file.stem  # e.g., "depth_estimate"
-        if node_dir.name == "nodes":
-            module_name = f"nodes.{module_name}"
 
         # Only proxy the FUNCTION method - helper methods are called internally
         # and don't need proxying (they run in the subprocess with the main method)
@@ -215,6 +213,8 @@ def _create_proxy_method(
         request = {
             "jsonrpc": "2.0",
             "id": request_id,
+            "module": module_name,
+            "class": class_name,
             "method": method_name,
             "params": serialized_params,
         }
@@ -242,7 +242,10 @@ def _create_proxy_method(
             _remove_process(env_name, node_package_dir)
             raise RuntimeError(f"Worker process died unexpectedly")
 
-        response = json.loads(response_line)
+        try:
+            response = json.loads(response_line)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Invalid JSON from worker: {repr(response_line[:200])}\nError: {e}")
 
         # Check for error
         if "error" in response:
@@ -288,7 +291,7 @@ def _get_or_create_process(
                 del _process_cache[cache_key]
 
     # Ensure environment is set up
-    env_manager = _get_or_create_env(
+    env_manager, env_config = _get_or_create_env(
         env_name=env_name,
         requirements=requirements,
         config_path=config_path,
@@ -299,7 +302,7 @@ def _get_or_create_process(
     )
 
     # Get Python executable from isolated env
-    python_exe = env_manager.get_python_path()
+    python_exe = env_manager.get_python(env_config)
 
     # Determine ComfyUI base directory
     comfyui_base = None
@@ -315,8 +318,6 @@ def _get_or_create_process(
     cmd = [
         str(python_exe),
         "-m", "comfyui_isolation.runner",
-        "--module", module_name,
-        "--class", class_name,
         "--node-dir", str(node_dir),
     ]
 
@@ -328,8 +329,6 @@ def _get_or_create_process(
 
     log_callback(f"Starting worker process...")
     log_callback(f"  Python: {python_exe}")
-    log_callback(f"  Module: {module_name}")
-    log_callback(f"  Class: {class_name}")
 
     # Spawn subprocess
     process = subprocess.Popen(
@@ -342,26 +341,48 @@ def _get_or_create_process(
         cwd=str(node_dir),
     )
 
-    # Start a thread to forward stderr to log
+    # Wait for ready signal with timeout - DON'T start stderr thread yet
+    # so we can capture startup errors properly
+    import select
+    startup_timeout = 30  # 30 seconds to start up
+
+    ready, _, _ = select.select([process.stdout], [], [], startup_timeout)
+
+    if not ready:
+        # Timeout waiting for ready signal
+        process.kill()
+        stderr_output = process.stderr.read()
+        raise RuntimeError(f"Worker failed to start (timeout after {startup_timeout}s):\n{stderr_output}")
+
+    ready_line = process.stdout.readline()
+
+    if not ready_line:
+        # Process exited without sending ready signal
+        process.wait()  # Ensure process is done
+        stderr_output = process.stderr.read()
+        raise RuntimeError(f"Worker process failed to start:\n{stderr_output}")
+
+    try:
+        ready_msg = json.loads(ready_line)
+    except json.JSONDecodeError:
+        process.kill()
+        stderr_output = process.stderr.read()
+        raise RuntimeError(f"Worker sent invalid ready signal: {ready_line}\nStderr:\n{stderr_output}")
+
+    if ready_msg.get("status") != "ready":
+        process.kill()
+        stderr_output = process.stderr.read()
+        raise RuntimeError(f"Worker sent unexpected ready signal: {ready_msg}\nStderr:\n{stderr_output}")
+
+    log_callback(f"Worker ready")
+
+    # NOW start stderr forwarding thread (after successful startup)
     def forward_stderr():
         for line in process.stderr:
             log_callback(line.rstrip())
 
-    import threading
     stderr_thread = threading.Thread(target=forward_stderr, daemon=True)
     stderr_thread.start()
-
-    # Wait for ready signal
-    ready_line = process.stdout.readline()
-    if not ready_line:
-        stderr_output = process.stderr.read()
-        raise RuntimeError(f"Worker failed to start:\n{stderr_output}")
-
-    ready = json.loads(ready_line)
-    if ready.get("status") != "ready":
-        raise RuntimeError(f"Worker sent unexpected ready signal: {ready}")
-
-    log_callback(f"Worker ready")
 
     # Cache the process
     with _cache_lock:
@@ -386,8 +407,12 @@ def _get_or_create_env(
     cuda_version: Optional[str],
     node_package_dir: Path,
     log_callback: Callable,
-) -> IsolatedEnvManager:
-    """Get or create an environment manager."""
+) -> tuple:
+    """Get or create an environment manager and config.
+
+    Returns:
+        Tuple of (IsolatedEnvManager, IsolatedEnv)
+    """
 
     cache_key = f"{env_name}:{node_package_dir}"
 
@@ -431,24 +456,25 @@ def _get_or_create_env(
         )
 
     # Create environment manager
-    env_manager = IsolatedEnvManager(env_config, base_dir=node_package_dir)
+    env_manager = IsolatedEnvManager(base_dir=node_package_dir, log_callback=log_callback)
 
     log_callback("=" * 50)
     log_callback(f"Setting up isolated environment: {env_name}")
     log_callback("=" * 50)
 
     # Ensure environment is ready
-    if env_manager.is_ready():
+    if env_manager.is_ready(env_config):
         log_callback("Environment already ready, skipping setup")
     else:
         log_callback("Creating isolated environment...")
-        env_manager.setup()
+        env_manager.setup(env_config)
 
-    # Cache the manager
+    # Cache the manager and config together
+    result = (env_manager, env_config)
     with _cache_lock:
-        _env_cache[cache_key] = env_manager
+        _env_cache[cache_key] = result
 
-    return env_manager
+    return result
 
 
 def shutdown_all_processes():

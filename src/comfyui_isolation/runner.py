@@ -1,27 +1,21 @@
 """
 Generic runner for isolated subprocess execution.
 
-This module is the entry point for subprocess execution. Instead of generating
-worker code, the host process spawns this runner with the module/class/method
-to execute. The runner imports the original node module and calls the method
-directly.
+This module is the entry point for subprocess execution. The runner handles
+requests for ANY @isolated class in the environment, importing classes on demand.
 
 Usage:
     python -m comfyui_isolation.runner \
-        --module nodes.depth_estimate \
-        --class SAM3D_DepthEstimate \
-        --method estimate_depth \
-        --node-dir /path/to/ComfyUI-SAM3DObjects \
+        --node-dir /path/to/ComfyUI-SAM3DObjects/nodes \
         --comfyui-base /path/to/ComfyUI \
         --import-paths ".,../vendor"
 
 The runner:
 1. Sets COMFYUI_ISOLATION_WORKER=1 (so @isolated decorator becomes no-op)
 2. Adds paths to sys.path
-3. Imports the module
-4. Creates class instance
-5. Reads JSON-RPC requests from stdin
-6. Calls methods and writes responses to stdout
+3. Reads JSON-RPC requests from stdin
+4. Dynamically imports classes as needed (cached)
+5. Calls methods and writes responses to stdout
 """
 
 import os
@@ -31,6 +25,7 @@ import argparse
 import traceback
 import warnings
 import logging
+import importlib
 from typing import Any, Dict, Optional
 
 # Suppress warnings that could interfere with JSON IPC
@@ -48,9 +43,13 @@ def setup_paths(node_dir: str, comfyui_base: Optional[str], import_paths: Option
 
     node_path = Path(node_dir)
 
-    # Add ComfyUI base first (for folder_paths, etc.)
+    # Set COMFYUI_BASE env var for stubs to use
     if comfyui_base:
-        sys.path.insert(0, comfyui_base)
+        os.environ["COMFYUI_BASE"] = comfyui_base
+
+    # Add comfyui-isolation stubs directory (provides folder_paths, etc.)
+    stubs_dir = Path(__file__).parent / "stubs"
+    sys.path.insert(0, str(stubs_dir))
 
     # Add import paths
     if import_paths:
@@ -64,18 +63,8 @@ def setup_paths(node_dir: str, comfyui_base: Optional[str], import_paths: Option
     sys.path.insert(0, str(node_path))
 
 
-def import_class(module_name: str, class_name: str):
-    """Import a class from a module."""
-    import importlib
-
-    module = importlib.import_module(module_name)
-    cls = getattr(module, class_name)
-    return cls
-
-
 def serialize_result(obj: Any) -> Any:
     """Serialize result for JSON transport."""
-    # Import protocol's encoder
     from comfyui_isolation.ipc.protocol import encode_object
     return encode_object(obj)
 
@@ -86,34 +75,39 @@ def deserialize_arg(obj: Any) -> Any:
     return decode_object(obj)
 
 
-def run_worker(module_name: str, class_name: str, node_dir: str,
-               comfyui_base: Optional[str], import_paths: Optional[str]):
+# Cache for imported classes and instances
+_class_cache: Dict[str, type] = {}
+_instance_cache: Dict[str, object] = {}
+
+
+def get_instance(module_name: str, class_name: str) -> object:
+    """Get or create an instance of a class."""
+    cache_key = f"{module_name}.{class_name}"
+
+    if cache_key not in _instance_cache:
+        # Import the class if not cached
+        if cache_key not in _class_cache:
+            print(f"[Runner] Importing {class_name} from {module_name}...", file=sys.stderr)
+            module = importlib.import_module(module_name)
+            cls = getattr(module, class_name)
+            _class_cache[cache_key] = cls
+
+        # Create instance
+        cls = _class_cache[cache_key]
+        _instance_cache[cache_key] = cls()
+        print(f"[Runner] Created instance of {class_name}", file=sys.stderr)
+
+    return _instance_cache[cache_key]
+
+
+def run_worker(node_dir: str, comfyui_base: Optional[str], import_paths: Optional[str]):
     """Main worker loop - reads requests from stdin, writes responses to stdout."""
 
     # Setup paths first
     setup_paths(node_dir, comfyui_base, import_paths)
 
-    # Import the class
-    try:
-        cls = import_class(module_name, class_name)
-        instance = cls()
-        print(f"[Runner] Loaded {class_name} from {module_name}", file=sys.stderr)
-    except Exception as e:
-        # Fatal error - can't even load the class
-        error_response = {
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {
-                "code": -32000,
-                "message": f"Failed to import {module_name}.{class_name}: {e}",
-                "data": {"traceback": traceback.format_exc()}
-            }
-        }
-        print(json.dumps(error_response), flush=True)
-        sys.exit(1)
-
     # Send ready signal
-    ready_msg = {"status": "ready", "class": class_name, "module": module_name}
+    ready_msg = {"status": "ready"}
     print(json.dumps(ready_msg), flush=True)
 
     # Main loop - read requests, execute, respond
@@ -137,6 +131,30 @@ def run_worker(module_name: str, class_name: str, node_dir: str,
                 print(json.dumps(response), flush=True)
                 break
 
+            # Get module/class from request
+            module_name = request.get("module")
+            class_name = request.get("class")
+
+            if not module_name or not class_name:
+                response["error"] = {
+                    "code": -32602,
+                    "message": "Missing 'module' or 'class' in request",
+                }
+                print(json.dumps(response), flush=True)
+                continue
+
+            # Get or create instance
+            try:
+                instance = get_instance(module_name, class_name)
+            except Exception as e:
+                response["error"] = {
+                    "code": -32000,
+                    "message": f"Failed to import {module_name}.{class_name}: {e}",
+                    "data": {"traceback": traceback.format_exc()}
+                }
+                print(json.dumps(response), flush=True)
+                continue
+
             # Get the method
             method = getattr(instance, method_name, None)
             if method is None:
@@ -152,15 +170,33 @@ def run_worker(module_name: str, class_name: str, node_dir: str,
             for key, value in params.items():
                 deserialized_params[key] = deserialize_arg(value)
 
+            # Redirect stdout to stderr during method execution
+            # This prevents print() in node code from corrupting JSON protocol
+            original_stdout = sys.stdout
+            sys.stdout = sys.stderr
+
+            # Also redirect at file descriptor level for C libraries that bypass Python
+            # (e.g., pymeshfix prints "INFO- Loaded X vertices..." directly to fd 1)
+            stdout_fd = original_stdout.fileno()
+            stderr_fd = sys.stderr.fileno()
+            stdout_fd_copy = os.dup(stdout_fd)
+            os.dup2(stderr_fd, stdout_fd)
+
             # Call the method
-            print(f"[Runner] Calling {method_name}...", file=sys.stderr)
-            result = method(**deserialized_params)
+            print(f"[Runner] Calling {class_name}.{method_name}...")
+            try:
+                result = method(**deserialized_params)
+            finally:
+                # Restore file descriptor first, then Python stdout
+                os.dup2(stdout_fd_copy, stdout_fd)
+                os.close(stdout_fd_copy)
+                sys.stdout = original_stdout
 
             # Serialize result
             serialized_result = serialize_result(result)
             response["result"] = serialized_result
 
-            print(f"[Runner] {method_name} completed", file=sys.stderr)
+            print(f"[Runner] {class_name}.{method_name} completed", file=sys.stderr)
 
         except Exception as e:
             tb = traceback.format_exc()
@@ -177,8 +213,6 @@ def run_worker(module_name: str, class_name: str, node_dir: str,
 
 def main():
     parser = argparse.ArgumentParser(description="Isolated node runner")
-    parser.add_argument("--module", required=True, help="Module path (e.g., nodes.depth_estimate)")
-    parser.add_argument("--class", dest="class_name", required=True, help="Class name")
     parser.add_argument("--node-dir", required=True, help="Node package directory")
     parser.add_argument("--comfyui-base", help="ComfyUI base directory")
     parser.add_argument("--import-paths", help="Comma-separated import paths")
@@ -186,8 +220,6 @@ def main():
     args = parser.parse_args()
 
     run_worker(
-        module_name=args.module,
-        class_name=args.class_name,
         node_dir=args.node_dir,
         comfyui_base=args.comfyui_base,
         import_paths=args.import_paths,

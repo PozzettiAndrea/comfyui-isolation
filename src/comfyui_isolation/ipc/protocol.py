@@ -157,6 +157,15 @@ def encode_object(obj: Any) -> Dict[str, Any]:
     if isinstance(obj, dict):
         return {k: encode_object(v) for k, v in obj.items()}
 
+    # For simple objects with __dict__, serialize as dict
+    # This avoids pickle module path issues across process boundaries
+    if hasattr(obj, '__dict__') and not hasattr(obj, '__slots__'):
+        return {
+            "_type": "object",
+            "_class": obj.__class__.__name__,
+            "_data": {k: encode_object(v) for k, v in obj.__dict__.items()},
+        }
+
     # For complex objects that can't be JSON serialized, use pickle
     try:
         json.dumps(obj)
@@ -214,6 +223,14 @@ def decode_object(obj: Any) -> Any:
 
     if obj_type == "pickle":
         return pickle.loads(decode_binary(obj["_data"]))
+
+    # Simple object serialized as dict - restore as SimpleNamespace
+    if obj_type == "object":
+        from types import SimpleNamespace
+        data = {k: decode_object(v) for k, v in obj["_data"].items()}
+        ns = SimpleNamespace(**data)
+        ns._class_name = obj.get("_class", "unknown")
+        return ns
 
     if obj_type in ("list", "tuple"):
         decoded = [decode_object(item) for item in obj["_data"]]
