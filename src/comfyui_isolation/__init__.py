@@ -46,6 +46,7 @@ from .env.security import (
 )
 from .ipc.bridge import WorkerBridge
 from .ipc.worker import BaseWorker, register
+from .decorator import isolated, shutdown_all_bridges
 
 # TorchBridge is optional (requires PyTorch)
 try:
@@ -76,6 +77,9 @@ __all__ = [
     "WorkerBridge",
     "BaseWorker",
     "register",
+    # Decorator API
+    "isolated",
+    "shutdown_all_bridges",
 ]
 
 # Add torch-based IPC if available

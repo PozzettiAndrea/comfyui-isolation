@@ -85,9 +85,36 @@ def encode_object(obj: Any) -> Dict[str, Any]:
 
     Returns a dict with _type and _data keys for special types,
     or the original object if it's JSON-serializable.
+
+    Special handling for ComfyUI types:
+    - IMAGE: torch tensor (B, H, W, C) float32 - encoded as "comfyui_image"
+    - MASK: torch tensor (B, H, W) or (H, W) float32 - encoded as "comfyui_mask"
     """
     if obj is None:
         return None
+
+    # Handle torch tensors (including ComfyUI IMAGE/MASK)
+    if hasattr(obj, 'cpu') and hasattr(obj, 'numpy'):
+        arr = obj.cpu().numpy()
+        shape = arr.shape
+
+        # Detect ComfyUI types by shape
+        # IMAGE: (B, H, W, C) where C is typically 3 or 4
+        # MASK: (B, H, W) or (H, W)
+        obj_type = "tensor"  # Default
+        if len(shape) == 4 and shape[-1] in (3, 4):
+            obj_type = "comfyui_image"
+        elif len(shape) in (2, 3) and arr.dtype in ('float32', 'float64'):
+            # Could be a mask - check if values are in [0, 1] range
+            if arr.min() >= 0 and arr.max() <= 1:
+                obj_type = "comfyui_mask"
+
+        return {
+            "_type": obj_type,
+            "_dtype": str(arr.dtype),
+            "_shape": list(shape),
+            "_data": encode_binary(pickle.dumps(arr)),
+        }
 
     # Handle numpy arrays
     if hasattr(obj, '__array__'):
@@ -95,16 +122,6 @@ def encode_object(obj: Any) -> Dict[str, Any]:
         arr = np.asarray(obj)
         return {
             "_type": "numpy",
-            "_dtype": str(arr.dtype),
-            "_shape": list(arr.shape),
-            "_data": encode_binary(pickle.dumps(arr)),
-        }
-
-    # Handle torch tensors
-    if hasattr(obj, 'cpu') and hasattr(obj, 'numpy'):
-        arr = obj.cpu().numpy()
-        return {
-            "_type": "tensor",
             "_dtype": str(arr.dtype),
             "_shape": list(arr.shape),
             "_data": encode_binary(pickle.dumps(arr)),
@@ -170,6 +187,18 @@ def decode_object(obj: Any) -> Any:
         return pickle.loads(decode_binary(obj["_data"]))
 
     if obj_type == "tensor":
+        import torch
+        arr = pickle.loads(decode_binary(obj["_data"]))
+        return torch.from_numpy(arr)
+
+    # ComfyUI IMAGE: (B, H, W, C) tensor
+    if obj_type == "comfyui_image":
+        import torch
+        arr = pickle.loads(decode_binary(obj["_data"]))
+        return torch.from_numpy(arr)
+
+    # ComfyUI MASK: (B, H, W) or (H, W) tensor
+    if obj_type == "comfyui_mask":
         import torch
         arr = pickle.loads(decode_binary(obj["_data"]))
         return torch.from_numpy(arr)
