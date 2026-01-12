@@ -40,6 +40,7 @@ class IsolatedEnv:
     python: str = "3.10"
     cuda: Optional[str] = None
     requirements: list[str] = field(default_factory=list)
+    no_deps_requirements: list[str] = field(default_factory=list)  # Install with --no-deps
     requirements_file: Optional[Path] = None
     wheel_sources: list[str] = field(default_factory=list)
     index_urls: list[str] = field(default_factory=list)

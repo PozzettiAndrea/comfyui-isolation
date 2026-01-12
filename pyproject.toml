@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-isolation"
-version = "0.2.1"
+version = "0.2.2"
 description = "Process isolation for ComfyUI custom nodes"
 readme = "README.md"
 license = {text = "MIT"}

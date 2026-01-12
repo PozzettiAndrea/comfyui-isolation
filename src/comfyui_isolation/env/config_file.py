@@ -24,6 +24,13 @@ Example config file (comfyui_isolation_reqs.toml):
 
     [variables]
     pytorch_version = "2.4.1"
+
+Available auto-derived variables:
+    - {cuda_version}: Full CUDA version (e.g., "12.8")
+    - {cuda_short}: CUDA version without dot (e.g., "128")
+    - {pytorch_version}: Full PyTorch version (e.g., "2.9.1")
+    - {pytorch_short}: PyTorch version without dots (e.g., "291")
+    - {pytorch_mm}: PyTorch major.minor without dot (e.g., "29")
 """
 
 import sys
@@ -140,10 +147,14 @@ def _get_default_pytorch_version(cuda_version: Optional[str]) -> str:
 
     Returns:
         PyTorch version string
+
+    Version Mapping:
+        - CUDA 12.4 (Pascal): PyTorch 2.5.1
+        - CUDA 12.8 (Turing+): PyTorch 2.8.0
     """
-    if cuda_version == "12.8":
-        return "2.8.0"  # Blackwell GPUs need PyTorch 2.8.0
-    return "2.4.1"  # Default for older CUDA versions
+    if cuda_version == "12.4":
+        return "2.5.1"  # Legacy: Pascal GPUs
+    return "2.8.0"  # Modern: Turing through Blackwell
 
 
 def _parse_config(data: Dict[str, Any], base_dir: Path) -> IsolatedEnv:
@@ -182,10 +193,21 @@ def _parse_config(data: Dict[str, Any], base_dir: Path) -> IsolatedEnv:
 
     if pytorch_version:
         variables.setdefault("pytorch_version", pytorch_version)
+        # Add short version without dots (e.g., "2.9.1" -> "291")
+        pytorch_short = pytorch_version.replace(".", "")
+        variables.setdefault("pytorch_short", pytorch_short)
+        # Add major.minor without dot (e.g., "2.9.1" -> "29") for wheel naming
+        parts = pytorch_version.split(".")[:2]
+        pytorch_mm = "".join(parts)
+        variables.setdefault("pytorch_mm", pytorch_mm)
 
     # Process requirements with variable substitution
     raw_requirements = packages_section.get("requirements", [])
     requirements = [_substitute_vars(req, variables) for req in raw_requirements]
+
+    # Process no_deps requirements (for packages with conflicting metadata)
+    raw_no_deps = packages_section.get("no_deps", [])
+    no_deps_requirements = [_substitute_vars(req, variables) for req in raw_no_deps]
 
     # Resolve requirements_file path (relative to base_dir)
     requirements_file = None
@@ -207,6 +229,7 @@ def _parse_config(data: Dict[str, Any], base_dir: Path) -> IsolatedEnv:
         cuda=cuda,
         pytorch_version=pytorch_version,
         requirements=requirements,
+        no_deps_requirements=no_deps_requirements,
         requirements_file=requirements_file,
         wheel_sources=wheel_sources,
         index_urls=index_urls,

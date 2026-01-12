@@ -284,6 +284,17 @@ class IsolatedEnvManager:
             if result.returncode != 0:
                 raise RuntimeError(f"Failed to install requirements: {result.stderr}")
 
+        # Install no-deps requirements first (e.g., CUDA extensions with conflicting metadata)
+        if env.no_deps_requirements:
+            self.log(f"Installing {len(env.no_deps_requirements)} packages (--no-deps)")
+            result = subprocess.run(
+                pip_args + ["--no-deps"] + env.no_deps_requirements,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to install no-deps packages: {result.stderr}")
+
         # Install individual requirements
         if env.requirements:
             self.log(f"Installing {len(env.requirements)} packages")

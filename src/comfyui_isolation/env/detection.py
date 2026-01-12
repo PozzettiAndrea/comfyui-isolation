@@ -102,18 +102,51 @@ def needs_cuda_128() -> bool:
     return False
 
 
+def is_legacy_gpu(compute_cap: str) -> bool:
+    """
+    Check if GPU is Pascal or older (requires legacy CUDA/PyTorch).
+
+    Args:
+        compute_cap: Compute capability string (e.g., "6.1", "7.5")
+
+    Returns:
+        True if Pascal or older (compute < 7.5)
+    """
+    try:
+        cc = float(compute_cap)
+        return cc < 7.5  # Turing starts at 7.5
+    except (ValueError, TypeError):
+        return False
+
+
 def detect_cuda_version() -> Optional[str]:
     """
     Get recommended CUDA version based on detected GPU.
 
     Returns:
-        "12.8" for Blackwell GPUs, "12.4" for all others,
+        "12.4" for Pascal or older (compute < 7.5),
+        "12.8" for Turing or newer (compute >= 7.5),
         None if no GPU detected.
+
+    GPU Architecture Reference:
+        - Pascal (GTX 10xx, P100): compute 6.0-6.1 → CUDA 12.4
+        - Turing (RTX 20xx, T4): compute 7.5 → CUDA 12.8
+        - Ampere (RTX 30xx, A100): compute 8.0-8.6 → CUDA 12.8
+        - Ada (RTX 40xx, L40): compute 8.9 → CUDA 12.8
+        - Hopper (H100): compute 9.0 → CUDA 12.8
+        - Blackwell (RTX 50xx, B100/B200): compute 10.0+ → CUDA 12.8
     """
     gpus = detect_gpu_info()
     if not gpus:
         return None
-    return "12.8" if needs_cuda_128() else "12.4"
+
+    # Check if any GPU is legacy (Pascal or older)
+    for gpu in gpus:
+        if is_legacy_gpu(gpu.get("compute_cap", "0.0")):
+            return "12.4"
+
+    # Turing or newer - use modern stack
+    return "12.8"
 
 
 def get_gpu_summary() -> str:
@@ -130,8 +163,14 @@ def get_gpu_summary() -> str:
 
     lines = []
     for i, gpu in enumerate(gpus):
-        is_blackwell = is_blackwell_gpu(gpu["name"], gpu["compute_cap"])
-        tag = " [Blackwell - CUDA 12.8]" if is_blackwell else ""
-        lines.append(f"  GPU {i}: {gpu['name']} (sm_{gpu['compute_cap'].replace('.', '')}){tag}")
+        cc = gpu.get("compute_cap", "0.0")
+        is_legacy = is_legacy_gpu(cc)
+        if is_legacy:
+            tag = " [Pascal - CUDA 12.4]"
+        elif is_blackwell_gpu(gpu["name"], cc):
+            tag = " [Blackwell - CUDA 12.8]"
+        else:
+            tag = " [CUDA 12.8]"
+        lines.append(f"  GPU {i}: {gpu['name']} (sm_{cc.replace('.', '')}){tag}")
 
     return "\n".join(lines)

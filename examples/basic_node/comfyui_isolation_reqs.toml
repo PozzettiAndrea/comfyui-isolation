@@ -55,8 +55,11 @@ requirements = [
 # Auto-populated variables (no need to define):
 #   {cuda_version} - e.g., "12.4"
 #   {cuda_short} - e.g., "124"
-#   {pytorch_version} - from [env] section if specified
+#   {pytorch_version} - e.g., "2.9.1"
+#   {pytorch_short} - e.g., "291" (version without dots)
+#   {pytorch_mm} - e.g., "29" (major.minor without dot, for wheel names)
 #
 # Example:
 #   pytorch_version = "2.4.1"
 #   pytorch3d_version = "0.7.8+5043d15pt{pytorch_version}cu{cuda_short}"
+#   flex_gemm = "0.0.1+cu{cuda_short}torch{pytorch_mm}"
