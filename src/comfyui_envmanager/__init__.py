@@ -40,12 +40,14 @@ This package provides:
 The @isolated decorator and WorkerBridge are still available.
 """
 
-__version__ = "0.0.7"
+__version__ = "0.0.8"
 
-from .env.config import IsolatedEnv
+from .env.config import IsolatedEnv, EnvManagerConfig, LocalConfig, NodeReq
 from .env.config_file import (
     load_env_from_file,
     discover_env_config,
+    load_config,
+    discover_config,
     CONFIG_FILE_NAMES,
 )
 from .env.manager import IsolatedEnvManager
@@ -119,12 +121,17 @@ __all__ = [
     "get_worker",
     "register_worker",
     "shutdown_workers",
-    # Environment
+    # Environment & Config
     "IsolatedEnv",
+    "EnvManagerConfig",
+    "LocalConfig",
+    "NodeReq",
     "IsolatedEnvManager",
     # Config file loading
     "load_env_from_file",
     "discover_env_config",
+    "load_config",
+    "discover_config",
     "CONFIG_FILE_NAMES",
     # Detection
     "detect_cuda_version",

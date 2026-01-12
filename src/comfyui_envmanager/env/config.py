@@ -2,7 +2,64 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
+
+
+@dataclass
+class LocalConfig:
+    """Configuration for local (host environment) installs.
+
+    These packages are installed into ComfyUI's main environment,
+    not into an isolated venv.
+    """
+    cuda_packages: Dict[str, str] = field(default_factory=dict)  # package -> version
+    requirements: List[str] = field(default_factory=list)
+
+
+@dataclass
+class NodeReq:
+    """A node dependency (another ComfyUI node pack)."""
+    name: str
+    repo: str  # GitHub repo path, e.g., "Kosinkadink/ComfyUI-VideoHelperSuite"
+
+
+@dataclass
+class EnvManagerConfig:
+    """
+    Full configuration parsed from comfyui_env.toml.
+
+    Supports the v2 schema:
+        [local.cuda]        - CUDA packages for host environment
+        [local.packages]    - Regular packages for host environment
+        [envname]           - Isolated env definition
+        [envname.cuda]      - CUDA packages for isolated env
+        [envname.packages]  - Regular packages for isolated env
+        [node_reqs]         - Node dependencies
+    """
+    local: LocalConfig = field(default_factory=LocalConfig)
+    envs: Dict[str, "IsolatedEnv"] = field(default_factory=dict)
+    node_reqs: List[NodeReq] = field(default_factory=list)
+
+    @property
+    def has_local(self) -> bool:
+        """Check if there are local packages to install."""
+        return bool(self.local.cuda_packages or self.local.requirements)
+
+    @property
+    def has_envs(self) -> bool:
+        """Check if there are isolated environments defined."""
+        return bool(self.envs)
+
+    def get_env(self, name: str) -> Optional["IsolatedEnv"]:
+        """Get an isolated environment by name."""
+        return self.envs.get(name)
+
+    @property
+    def default_env(self) -> Optional["IsolatedEnv"]:
+        """Get the first/only isolated environment, or None."""
+        if self.envs:
+            return next(iter(self.envs.values()))
+        return None
 
 
 @dataclass

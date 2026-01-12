@@ -61,7 +61,7 @@ else:
     except ImportError:
         tomllib = None  # type: ignore
 
-from .config import IsolatedEnv
+from .config import IsolatedEnv, EnvManagerConfig, LocalConfig, NodeReq
 from .detection import detect_cuda_version
 
 
@@ -327,3 +327,268 @@ def _substitute_vars(s: str, variables: Dict[str, str]) -> str:
     for key, value in variables.items():
         s = s.replace(f"{{{key}}}", str(value))
     return s
+
+
+# =============================================================================
+# V2 Schema Parser
+# =============================================================================
+
+# Reserved table names that are NOT isolated environments
+RESERVED_TABLES = {"local", "node_reqs", "env", "packages", "sources", "cuda", "variables", "worker"}
+
+
+def load_config(
+    path: Path,
+    base_dir: Optional[Path] = None,
+) -> EnvManagerConfig:
+    """
+    Load full EnvManagerConfig from a TOML file (v2 schema).
+
+    Supports both v2 schema and legacy format (auto-detected).
+
+    Args:
+        path: Path to the TOML config file
+        base_dir: Base directory for resolving relative paths
+
+    Returns:
+        EnvManagerConfig with local, envs, and node_reqs
+
+    Example:
+        >>> config = load_config(Path("comfyui_env.toml"))
+        >>> if config.has_local:
+        ...     print(f"Local CUDA packages: {config.local.cuda_packages}")
+        >>> for name, env in config.envs.items():
+        ...     print(f"Isolated env: {name}")
+    """
+    if tomllib is None:
+        raise ImportError(
+            "TOML parsing requires tomli for Python < 3.11. "
+            "Install it with: pip install tomli"
+        )
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+
+    base_dir = Path(base_dir) if base_dir else path.parent
+
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+    return _parse_config_v2(data, base_dir)
+
+
+def discover_config(
+    node_dir: Path,
+    file_names: Optional[List[str]] = None,
+) -> Optional[EnvManagerConfig]:
+    """
+    Auto-discover and load EnvManagerConfig from a node directory.
+
+    Args:
+        node_dir: Directory to search for config files
+        file_names: Custom list of file names to search
+
+    Returns:
+        EnvManagerConfig if found, None otherwise
+    """
+    if tomllib is None:
+        return None
+
+    node_dir = Path(node_dir)
+    file_names = file_names or CONFIG_FILE_NAMES
+
+    for name in file_names:
+        config_path = node_dir / name
+        if config_path.exists():
+            return load_config(config_path, node_dir)
+
+    return None
+
+
+def _parse_config_v2(data: Dict[str, Any], base_dir: Path) -> EnvManagerConfig:
+    """
+    Parse TOML data into EnvManagerConfig (v2 schema).
+
+    Schema:
+        [local.cuda]        - CUDA packages for host
+        [local.packages]    - Regular packages for host
+        [envname]           - Isolated env (python, cuda, pytorch)
+        [envname.cuda]      - CUDA packages for env
+        [envname.packages]  - Packages for env
+        [node_reqs]         - Node dependencies
+
+    Also supports legacy format for backward compatibility.
+    """
+    # Detect if this is v2 schema or legacy
+    is_v2 = "local" in data or _has_named_env(data)
+
+    if not is_v2:
+        # Legacy format - convert to v2 structure
+        return _convert_legacy_to_v2(data, base_dir)
+
+    # Parse v2 schema
+    local = _parse_local_section(data.get("local", {}))
+    envs = _parse_env_sections(data, base_dir)
+    node_reqs = _parse_node_reqs(data.get("node_reqs", {}))
+
+    return EnvManagerConfig(
+        local=local,
+        envs=envs,
+        node_reqs=node_reqs,
+    )
+
+
+def _has_named_env(data: Dict[str, Any]) -> bool:
+    """Check if data has any named environment tables (not reserved names)."""
+    env_indicators = ["python", "cuda", "pytorch", "cuda_version", "pytorch_version"]
+    for key in data.keys():
+        if key not in RESERVED_TABLES and isinstance(data[key], dict):
+            # Check if it looks like an env definition
+            section = data[key]
+            if any(k in section for k in env_indicators):
+                return True
+    return False
+
+
+def _parse_local_section(local_data: Dict[str, Any]) -> LocalConfig:
+    """Parse [local] section."""
+    cuda_packages = {}
+    requirements = []
+
+    # [local.cuda] - CUDA packages
+    cuda_section = local_data.get("cuda", {})
+    if isinstance(cuda_section, dict):
+        for pkg, ver in cuda_section.items():
+            cuda_packages[pkg] = ver if ver and ver != "*" else ""
+
+    # [local.packages] - regular packages
+    packages_section = local_data.get("packages", {})
+    if isinstance(packages_section, dict):
+        requirements = packages_section.get("requirements", [])
+    elif isinstance(packages_section, list):
+        requirements = packages_section
+
+    return LocalConfig(
+        cuda_packages=cuda_packages,
+        requirements=requirements,
+    )
+
+
+def _parse_env_sections(data: Dict[str, Any], base_dir: Path) -> Dict[str, IsolatedEnv]:
+    """Parse named environment sections."""
+    envs = {}
+    env_indicators = ["python", "cuda", "pytorch", "cuda_version", "pytorch_version"]
+
+    for key, value in data.items():
+        if key in RESERVED_TABLES:
+            continue
+        if not isinstance(value, dict):
+            continue
+
+        # Check if this looks like an env definition
+        if not any(k in value for k in env_indicators):
+            continue
+
+        env = _parse_single_env(key, value, base_dir)
+        envs[key] = env
+
+    return envs
+
+
+def _parse_single_env(name: str, env_data: Dict[str, Any], base_dir: Path) -> IsolatedEnv:
+    """Parse a single isolated environment section."""
+    # Get basic env config
+    python = env_data.get("python", "3.10")
+    # Support both "cuda" and "cuda_version" field names (cuda_version avoids conflict with [envname.cuda] table)
+    cuda = env_data.get("cuda_version") or env_data.get("cuda", "auto")
+    pytorch = env_data.get("pytorch_version") or env_data.get("pytorch", "auto")
+
+    # Handle auto-detection
+    if cuda == "auto":
+        cuda = detect_cuda_version()
+    elif cuda in ("null", "none", None):
+        cuda = None
+
+    if pytorch == "auto":
+        pytorch = _get_default_pytorch_version(cuda)
+
+    # Parse [envname.cuda] - CUDA packages
+    cuda_section = env_data.get("cuda", {})
+    no_deps_requirements = []
+    if isinstance(cuda_section, dict):
+        for pkg, ver in cuda_section.items():
+            if ver == "*" or ver == "":
+                no_deps_requirements.append(pkg)
+            else:
+                no_deps_requirements.append(f"{pkg}=={ver}")
+
+    # Parse [envname.packages] - regular packages
+    packages_section = env_data.get("packages", {})
+    requirements = []
+    if isinstance(packages_section, dict):
+        requirements = packages_section.get("requirements", [])
+    elif isinstance(packages_section, list):
+        requirements = packages_section
+
+    return IsolatedEnv(
+        name=name,
+        python=python,
+        cuda=cuda,
+        pytorch_version=pytorch,
+        requirements=requirements,
+        no_deps_requirements=no_deps_requirements,
+    )
+
+
+def _parse_node_reqs(node_reqs_data: Dict[str, Any]) -> List[NodeReq]:
+    """Parse [node_reqs] section."""
+    reqs = []
+
+    for name, value in node_reqs_data.items():
+        if isinstance(value, str):
+            # Simple format: VideoHelperSuite = "Kosinkadink/ComfyUI-VideoHelperSuite"
+            reqs.append(NodeReq(name=name, repo=value))
+        elif isinstance(value, dict):
+            # Extended format: VideoHelperSuite = { repo = "..." }
+            repo = value.get("repo", "")
+            reqs.append(NodeReq(name=name, repo=repo))
+
+    return reqs
+
+
+def _convert_legacy_to_v2(data: Dict[str, Any], base_dir: Path) -> EnvManagerConfig:
+    """Convert legacy config format to v2 EnvManagerConfig."""
+    # Parse using legacy parser to get IsolatedEnv
+    legacy_env = _parse_config(data, base_dir)
+
+    # Check if this is really just a Type 2 config (local CUDA only, no venv)
+    # Type 2 indicators: no [env] section with name, or name matches directory
+    env_section = data.get("env", {})
+    has_explicit_env = bool(env_section.get("name") or env_section.get("python"))
+
+    if has_explicit_env:
+        # This is a Type 1 config (isolated venv)
+        return EnvManagerConfig(
+            local=LocalConfig(),
+            envs={legacy_env.name: legacy_env},
+            node_reqs=[],
+        )
+    else:
+        # This is a Type 2 config (local CUDA only)
+        cuda_packages = {}
+        for req in legacy_env.no_deps_requirements:
+            if "==" in req:
+                pkg, ver = req.split("==", 1)
+                cuda_packages[pkg] = ver
+            else:
+                cuda_packages[req] = ""
+
+        return EnvManagerConfig(
+            local=LocalConfig(
+                cuda_packages=cuda_packages,
+                requirements=legacy_env.requirements,
+            ),
+            envs={},
+            node_reqs=[],
+        )
