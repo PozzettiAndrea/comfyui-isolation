@@ -28,6 +28,7 @@ from .env.config import IsolatedEnv
 from .env.config_file import discover_env_config, load_env_from_file
 from .env.manager import IsolatedEnvManager
 from .errors import CUDANotFoundError, DependencyError, InstallError, WheelNotFoundError
+from .registry import PACKAGE_REGISTRY, get_cuda_short2, is_registered
 from .resolver import RuntimeEnv, WheelResolver, parse_wheel_requirement
 
 
@@ -136,7 +137,7 @@ def _install_inplace(
     dry_run: bool,
     verify_wheels: bool,
 ) -> bool:
-    """Install in-place into current environment."""
+    """Install in-place into current environment using the package registry."""
     log("Installing in-place mode")
 
     # Detect runtime environment
@@ -145,51 +146,35 @@ def _install_inplace(
 
     # Check CUDA requirement
     if not env.cuda_version:
-        # Check if any requirements need CUDA
         cuda_packages = _get_cuda_packages(env_config)
         if cuda_packages:
             raise CUDANotFoundError(package=", ".join(cuda_packages))
 
-    # Split requirements into CUDA and regular packages
+    # Get packages to install
     cuda_packages = _get_cuda_packages(env_config)
     regular_packages = _get_regular_packages(env_config)
 
-    # Resolve CUDA wheel URLs
-    resolver = WheelResolver()
-    cuda_urls = {}
-
-    for req in cuda_packages:
-        package, version = parse_wheel_requirement(req)
-        if version is None:
-            log(f"Warning: No version specified for {package}, skipping wheel resolution")
-            continue
-
-        try:
-            url = resolver.resolve(package, version, env, verify=verify_wheels)
-            cuda_urls[package] = url
-            log(f"Resolved {package}: {url}")
-        except WheelNotFoundError as e:
-            if dry_run:
-                log(f"Warning: Could not resolve {package}=={version}")
-            else:
-                raise
+    # Legacy wheel sources from config (for packages not in registry)
+    legacy_wheel_sources = env_config.wheel_sources or []
 
     if dry_run:
         log("\nDry run - would install:")
-        if cuda_urls:
-            log("  CUDA packages (--no-deps):")
-            for pkg, url in cuda_urls.items():
-                log(f"    {pkg}: {url}")
+        for req in cuda_packages:
+            package, version = parse_wheel_requirement(req)
+            install_info = _get_install_info(package, version, env, legacy_wheel_sources)
+            log(f"  {package}: {install_info['description']}")
         if regular_packages:
             log("  Regular packages:")
             for pkg in regular_packages:
                 log(f"    {pkg}")
         return True
 
-    # Install CUDA packages first (with --no-deps to avoid conflicts)
-    if cuda_urls:
-        log(f"\nInstalling {len(cuda_urls)} CUDA packages...")
-        _pip_install(list(cuda_urls.values()), no_deps=True, log=log)
+    # Install CUDA packages using appropriate method per package
+    if cuda_packages:
+        log(f"\nInstalling {len(cuda_packages)} CUDA packages...")
+        for req in cuda_packages:
+            package, version = parse_wheel_requirement(req)
+            _install_cuda_package(package, version, env, legacy_wheel_sources, log)
 
     # Install regular packages
     if regular_packages:
@@ -198,6 +183,168 @@ def _install_inplace(
 
     log("\nInstallation complete!")
     return True
+
+
+def _get_install_info(
+    package: str,
+    version: Optional[str],
+    env: RuntimeEnv,
+    legacy_wheel_sources: List[str],
+) -> Dict[str, str]:
+    """Get installation info for a package (for dry-run output)."""
+    pkg_lower = package.lower()
+
+    if pkg_lower in PACKAGE_REGISTRY:
+        config = PACKAGE_REGISTRY[pkg_lower]
+        method = config["method"]
+        index_url = _substitute_template(config.get("index_url", ""), env)
+
+        if method == "index":
+            return {"method": method, "description": f"from index {index_url}"}
+        elif method == "github_index":
+            return {"method": method, "description": f"from {index_url}"}
+        elif method == "pypi_variant":
+            vars_dict = env.as_dict()
+            if env.cuda_version:
+                vars_dict["cuda_short2"] = get_cuda_short2(env.cuda_version)
+            actual_pkg = _substitute_template(config["package_template"], vars_dict)
+            return {"method": method, "description": f"as {actual_pkg} from PyPI"}
+    elif legacy_wheel_sources:
+        return {"method": "legacy", "description": f"from config wheel_sources"}
+    else:
+        return {"method": "unknown", "description": "NOT IN REGISTRY - will fail"}
+
+
+def _install_cuda_package(
+    package: str,
+    version: Optional[str],
+    env: RuntimeEnv,
+    legacy_wheel_sources: List[str],
+    log: Callable[[str], None],
+) -> None:
+    """Install a single CUDA package using the appropriate method from registry."""
+    pkg_lower = package.lower()
+
+    # Check if package is in registry
+    if pkg_lower in PACKAGE_REGISTRY:
+        config = PACKAGE_REGISTRY[pkg_lower]
+        method = config["method"]
+
+        if method == "index":
+            # PEP 503 index - use pip --extra-index-url
+            index_url = _substitute_template(config["index_url"], env)
+            pkg_spec = f"{package}=={version}" if version else package
+            log(f"  Installing {package} from PyG index...")
+            _pip_install_with_index(pkg_spec, index_url, log)
+
+        elif method == "github_index":
+            # GitHub Pages index - use pip --find-links
+            index_url = _substitute_template(config["index_url"], env)
+            pkg_spec = f"{package}=={version}" if version else package
+            log(f"  Installing {package} from GitHub wheels...")
+            _pip_install_with_find_links(pkg_spec, index_url, log)
+
+        elif method == "pypi_variant":
+            # Transform package name based on CUDA version
+            vars_dict = env.as_dict()
+            if env.cuda_version:
+                vars_dict["cuda_short2"] = get_cuda_short2(env.cuda_version)
+            actual_package = _substitute_template(config["package_template"], vars_dict)
+            pkg_spec = f"{actual_package}=={version}" if version else actual_package
+            log(f"  Installing {package} as {actual_package}...")
+            _pip_install([pkg_spec], no_deps=False, log=log)
+
+    elif legacy_wheel_sources:
+        # Fall back to legacy wheel sources from config
+        log(f"  Installing {package} from config wheel_sources...")
+        resolver = WheelResolver()
+        if version:
+            try:
+                url = resolver.resolve(package, version, env, verify=False)
+                _pip_install([url], no_deps=True, log=log)
+            except WheelNotFoundError:
+                # Try with find-links
+                pkg_spec = f"{package}=={version}"
+                for source in legacy_wheel_sources:
+                    source_url = _substitute_template(source, env)
+                    try:
+                        _pip_install_with_find_links(pkg_spec, source_url, log)
+                        return
+                    except InstallError:
+                        continue
+                raise WheelNotFoundError(
+                    package=package,
+                    version=version,
+                    env=env,
+                    tried_urls=legacy_wheel_sources,
+                    reason="Not found in any wheel source",
+                )
+    else:
+        # Package not in registry and no legacy sources
+        raise WheelNotFoundError(
+            package=package,
+            version=version,
+            env=env,
+            tried_urls=[],
+            reason=f"Package '{package}' not in registry. "
+                   f"Known packages: {', '.join(sorted(PACKAGE_REGISTRY.keys()))}. "
+                   f"Add [sources] wheel_sources to config for custom packages.",
+        )
+
+
+def _substitute_template(template: str, env: RuntimeEnv) -> str:
+    """Substitute template variables with runtime environment values."""
+    vars_dict = env.as_dict()
+
+    # Add py_minor for pytorch3d URL pattern
+    if env.python_version:
+        vars_dict["py_minor"] = env.python_version.split(".")[-1]
+
+    result = template
+    for key, value in vars_dict.items():
+        if value is not None:
+            result = result.replace(f"{{{key}}}", str(value))
+    return result
+
+
+def _pip_install_with_index(
+    package: str,
+    index_url: str,
+    log: Callable[[str], None],
+) -> None:
+    """Install package using pip with --extra-index-url."""
+    pip_cmd = _get_pip_command()
+    args = pip_cmd + ["install", "--extra-index-url", index_url, package]
+
+    log(f"    Running: pip install --extra-index-url ... {package}")
+    result = subprocess.run(args, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        raise InstallError(
+            f"Failed to install {package}",
+            exit_code=result.returncode,
+            stderr=result.stderr,
+        )
+
+
+def _pip_install_with_find_links(
+    package: str,
+    find_links_url: str,
+    log: Callable[[str], None],
+) -> None:
+    """Install package using pip with --find-links."""
+    pip_cmd = _get_pip_command()
+    args = pip_cmd + ["install", "--find-links", find_links_url, package]
+
+    log(f"    Running: pip install --find-links ... {package}")
+    result = subprocess.run(args, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        raise InstallError(
+            f"Failed to install {package}",
+            exit_code=result.returncode,
+            stderr=result.stderr,
+        )
 
 
 def _get_cuda_packages(env_config: IsolatedEnv) -> List[str]:

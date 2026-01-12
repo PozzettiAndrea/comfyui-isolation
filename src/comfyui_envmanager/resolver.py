@@ -127,12 +127,16 @@ class RuntimeEnv:
 
     def as_dict(self) -> Dict[str, str]:
         """Convert to dict for template substitution."""
+        # Extract py_minor from python_version (e.g., "3.10" -> "10")
+        py_minor = self.python_version.split(".")[-1] if self.python_version else ""
+
         result = {
             "os": self.os_name,
             "platform": self.platform_tag,
             "python_version": self.python_version,
             "py_version": self.python_version,
             "py_short": self.python_short,
+            "py_minor": py_minor,
         }
 
         if self.cuda_version:

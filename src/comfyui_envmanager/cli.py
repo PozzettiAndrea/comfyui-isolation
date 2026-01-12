@@ -6,6 +6,7 @@ Provides the `comfy-env` command with subcommands:
 - info: Show runtime environment information
 - resolve: Show resolved wheel URLs
 - doctor: Verify installation
+- list-packages: Show all packages in the built-in registry
 
 Usage:
     comfy-env install
@@ -18,6 +19,8 @@ Usage:
     comfy-env resolve --all
 
     comfy-env doctor
+
+    comfy-env list-packages
 """
 
 import argparse
@@ -128,6 +131,18 @@ def main(args: Optional[List[str]] = None) -> int:
         help="Path to config file",
     )
 
+    # list-packages command
+    list_parser = subparsers.add_parser(
+        "list-packages",
+        help="Show all packages in the built-in registry",
+        description="List CUDA packages that comfyui-envmanager knows how to install",
+    )
+    list_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output as JSON",
+    )
+
     parsed = parser.parse_args(args)
 
     if parsed.command is None:
@@ -143,6 +158,8 @@ def main(args: Optional[List[str]] = None) -> int:
             return cmd_resolve(parsed)
         elif parsed.command == "doctor":
             return cmd_doctor(parsed)
+        elif parsed.command == "list-packages":
+            return cmd_list_packages(parsed)
         else:
             parser.print_help()
             return 1
@@ -310,6 +327,61 @@ def cmd_doctor(args) -> int:
     else:
         print("  No packages to verify (no config found)")
         return 0
+
+
+def cmd_list_packages(args) -> int:
+    """Handle list-packages command."""
+    from .registry import PACKAGE_REGISTRY, list_packages
+
+    if args.json:
+        import json
+        result = {}
+        for name, config in PACKAGE_REGISTRY.items():
+            result[name] = {
+                "method": config["method"],
+                "description": config.get("description", ""),
+            }
+            if "index_url" in config:
+                result[name]["index_url"] = config["index_url"]
+            if "package_template" in config:
+                result[name]["package_template"] = config["package_template"]
+        print(json.dumps(result, indent=2))
+        return 0
+
+    print("Built-in CUDA Package Registry")
+    print("=" * 60)
+    print()
+    print("These packages can be installed without specifying wheel_sources.")
+    print("Just add them to your comfyui_env.toml:")
+    print()
+    print("  [cuda]")
+    print("  torch-scatter = \"2.1.2\"")
+    print("  torch-cluster = \"1.6.3\"")
+    print()
+    print("-" * 60)
+
+    # Group packages by method
+    by_method = {}
+    for name, config in PACKAGE_REGISTRY.items():
+        method = config["method"]
+        if method not in by_method:
+            by_method[method] = []
+        by_method[method].append((name, config))
+
+    method_labels = {
+        "index": "PEP 503 Index (pip --extra-index-url)",
+        "github_index": "GitHub Pages (pip --find-links)",
+        "pypi_variant": "PyPI with CUDA variant names",
+    }
+
+    for method, packages in by_method.items():
+        print(f"\n{method_labels.get(method, method)}:")
+        for name, config in sorted(packages):
+            desc = config.get("description", "")
+            print(f"  {name:20} - {desc}")
+
+    print()
+    return 0
 
 
 if __name__ == "__main__":

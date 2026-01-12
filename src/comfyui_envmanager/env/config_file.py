@@ -4,7 +4,29 @@ This module provides declarative configuration for isolated environments,
 allowing custom nodes to define their requirements in a TOML file instead
 of programmatically.
 
-Example config file (comfyui_env.toml):
+Simplified config (recommended for CUDA packages only):
+
+    # comfyui_env.toml - just list CUDA packages
+    [cuda]
+    torch-scatter = "2.1.2"
+    torch-cluster = "1.6.3"
+    spconv = "*"  # latest compatible
+
+Or as a list:
+
+    cuda = [
+        "torch-scatter==2.1.2",
+        "torch-cluster==1.6.3",
+        "spconv",
+    ]
+
+Optional overrides:
+
+    [env]
+    cuda = "12.4"       # Override auto-detection
+    pytorch = "2.5.1"   # Override auto-detection
+
+Legacy format (still supported):
 
     [env]
     name = "my-node"
@@ -12,18 +34,11 @@ Example config file (comfyui_env.toml):
     cuda = "auto"
 
     [packages]
-    requirements = [
-        "torch=={pytorch_version}",
-        "my-package>=1.0.0",
-    ]
-    requirements_file = "requirements.txt"
+    requirements = ["my-package>=1.0.0"]
+    no_deps = ["torch-scatter==2.1.2"]
 
     [sources]
     wheel_sources = ["https://my-wheels.github.io/"]
-    index_urls = ["https://pypi.org/simple/"]
-
-    [variables]
-    pytorch_version = "2.4.1"
 
 Available auto-derived variables:
     - {cuda_version}: Full CUDA version (e.g., "12.8")
@@ -163,6 +178,22 @@ def _parse_config(data: Dict[str, Any], base_dir: Path) -> IsolatedEnv:
     """
     Parse TOML data into IsolatedEnv.
 
+    Supports both simplified and legacy config formats:
+
+    Simplified (CUDA packages only):
+        [packages]
+        torch-scatter = "2.1.2"
+        torch-cluster = "1.6.3"
+
+    Or as list:
+        packages = ["torch-scatter==2.1.2", "torch-cluster==1.6.3"]
+
+    Legacy:
+        [env]
+        name = "my-node"
+        [packages]
+        no_deps = ["torch-scatter==2.1.2"]
+
     Args:
         data: Parsed TOML data
         base_dir: Base directory for resolving relative paths
@@ -176,8 +207,8 @@ def _parse_config(data: Dict[str, Any], base_dir: Path) -> IsolatedEnv:
     worker_section = data.get("worker", {})
     variables = dict(data.get("variables", {}))  # Copy to avoid mutation
 
-    # Handle CUDA version
-    cuda = env_section.get("cuda")
+    # Handle CUDA version - default to "auto" if not specified
+    cuda = env_section.get("cuda", "auto")
     if cuda == "auto":
         cuda = detect_cuda_version()
     elif cuda == "null" or cuda == "none":
@@ -189,7 +220,7 @@ def _parse_config(data: Dict[str, Any], base_dir: Path) -> IsolatedEnv:
         variables.setdefault("cuda_short", cuda.replace(".", ""))
 
     # Handle pytorch version - auto-derive if "auto" or not specified
-    pytorch_version = env_section.get("pytorch_version")
+    pytorch_version = env_section.get("pytorch_version") or env_section.get("pytorch")
     if pytorch_version == "auto" or (pytorch_version is None and cuda):
         pytorch_version = _get_default_pytorch_version(cuda)
 
@@ -203,21 +234,59 @@ def _parse_config(data: Dict[str, Any], base_dir: Path) -> IsolatedEnv:
         pytorch_mm = "".join(parts)
         variables.setdefault("pytorch_mm", pytorch_mm)
 
-    # Process requirements with variable substitution
-    raw_requirements = packages_section.get("requirements", [])
-    requirements = [_substitute_vars(req, variables) for req in raw_requirements]
+    # Parse CUDA packages - support multiple formats
+    # Priority: [cuda] section > cuda = [...] > legacy [packages] section
+    no_deps_requirements = []
+    requirements = []
 
-    # Process no_deps requirements (for packages with conflicting metadata)
-    raw_no_deps = packages_section.get("no_deps", [])
-    no_deps_requirements = [_substitute_vars(req, variables) for req in raw_no_deps]
+    cuda_section = data.get("cuda", {})
+
+    if cuda_section:
+        # New format: [cuda] section or cuda = [...]
+        if isinstance(cuda_section, list):
+            # Format: cuda = ["torch-scatter==2.1.2", ...]
+            no_deps_requirements = [_substitute_vars(req, variables) for req in cuda_section]
+        elif isinstance(cuda_section, dict):
+            # Format: [cuda] with package = "version" pairs
+            for pkg, ver in cuda_section.items():
+                if ver == "*" or ver == "":
+                    no_deps_requirements.append(pkg)
+                else:
+                    no_deps_requirements.append(f"{pkg}=={ver}")
+
+    elif isinstance(packages_section, list):
+        # Legacy format: packages = ["torch-scatter==2.1.2", ...]
+        no_deps_requirements = [_substitute_vars(req, variables) for req in packages_section]
+
+    elif isinstance(packages_section, dict):
+        # Check for simplified format: [packages] with key=value pairs
+        # vs legacy format: [packages] with requirements/no_deps lists
+
+        has_legacy_keys = any(k in packages_section for k in ["requirements", "no_deps", "requirements_file"])
+
+        if has_legacy_keys:
+            # Legacy format
+            raw_requirements = packages_section.get("requirements", [])
+            requirements = [_substitute_vars(req, variables) for req in raw_requirements]
+
+            raw_no_deps = packages_section.get("no_deps", [])
+            no_deps_requirements = [_substitute_vars(req, variables) for req in raw_no_deps]
+        else:
+            # Simplified format: [packages] with package = "version" pairs
+            # All packages are CUDA packages
+            for pkg, ver in packages_section.items():
+                if ver == "*" or ver == "":
+                    no_deps_requirements.append(pkg)
+                else:
+                    no_deps_requirements.append(f"{pkg}=={ver}")
 
     # Resolve requirements_file path (relative to base_dir)
     requirements_file = None
-    if "requirements_file" in packages_section:
+    if isinstance(packages_section, dict) and "requirements_file" in packages_section:
         req_file_path = packages_section["requirements_file"]
         requirements_file = base_dir / req_file_path
 
-    # Get wheel sources and index URLs
+    # Get wheel sources and index URLs (optional - registry handles most cases now)
     wheel_sources = sources_section.get("wheel_sources", [])
     index_urls = sources_section.get("index_urls", [])
 
