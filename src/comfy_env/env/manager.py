@@ -436,7 +436,15 @@ class IsolatedEnvManager:
     ) -> None:
         """Install package from GitHub release wheels with fallback sources."""
         import platform as plat
-        current_platform = f"{plat.system().lower()}_{plat.machine().lower()}"
+        import sys
+        # Use consistent platform tags (win_amd64, linux_x86_64, etc.)
+        if sys.platform == 'win32':
+            machine = plat.machine().lower()
+            current_platform = 'win_amd64' if machine in ('amd64', 'x86_64') else f'win_{machine}'
+        elif sys.platform == 'darwin':
+            current_platform = f"macosx_{plat.machine()}"
+        else:
+            current_platform = f"linux_{plat.machine()}"
 
         sources = config.get("sources", [])
         errors = []
