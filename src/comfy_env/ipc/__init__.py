@@ -12,6 +12,8 @@ from .protocol import (
 )
 from .transport import (
     Transport,
+    QueueTransport,
+    create_queue_pair,
     UnixSocketTransport,
     StdioTransport,
     get_socket_path,
@@ -44,6 +46,8 @@ __all__ = [
     "get_tensor_ipc_enabled",
     # Transport
     "Transport",
+    "QueueTransport",
+    "create_queue_pair",
     "UnixSocketTransport",
     "StdioTransport",
     "get_socket_path",

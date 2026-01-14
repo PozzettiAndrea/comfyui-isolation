@@ -2,7 +2,8 @@
 Transport Layer - Pluggable IPC transports for host-worker communication.
 
 Supports:
-- UnixSocketTransport: Unix Domain Sockets with length-prefixed JSON (recommended)
+- QueueTransport: multiprocessing.Queue with zero-copy tensor support (recommended)
+- UnixSocketTransport: Unix Domain Sockets with length-prefixed JSON (Linux/macOS only)
 - StdioTransport: Legacy stdin/stdout JSON lines (fallback)
 
 The transport abstraction allows swapping IPC mechanisms without changing
@@ -17,7 +18,7 @@ import sys
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Optional, Protocol, runtime_checkable
+from typing import Any, Optional, Protocol, Tuple, runtime_checkable
 
 
 @runtime_checkable
@@ -35,6 +36,91 @@ class Transport(Protocol):
     def close(self) -> None:
         """Close the transport. Further send/recv calls may fail."""
         ...
+
+
+def create_queue_pair(share_torch: bool = True):
+    """
+    Create a pair of queues for bidirectional IPC.
+
+    When share_torch=True, uses torch.multiprocessing for zero-copy tensor transfer.
+    This works cross-platform (Windows, Linux, macOS).
+
+    Args:
+        share_torch: If True, use torch.multiprocessing for zero-copy tensors.
+
+    Returns:
+        Tuple of (to_worker_queue, from_worker_queue, multiprocessing_module)
+    """
+    if share_torch:
+        try:
+            import torch.multiprocessing as mp
+        except ImportError:
+            import multiprocessing as mp
+    else:
+        import multiprocessing as mp
+
+    # Ensure spawn method for proper isolation
+    start_method = mp.get_start_method(allow_none=True)
+    if start_method is None:
+        mp.set_start_method("spawn")
+
+    to_worker = mp.Queue()
+    from_worker = mp.Queue()
+    return to_worker, from_worker, mp
+
+
+class QueueTransport:
+    """
+    Cross-platform transport using multiprocessing.Queue.
+
+    This is the recommended transport as it:
+    - Works on Windows, Linux, and macOS (no AF_UNIX dependency)
+    - Supports zero-copy tensor transfer when using torch.multiprocessing
+    - Has simpler code than socket-based transports
+    - Is battle-tested (used by pyisolate)
+
+    When share_torch=True, PyTorch tensors are transferred via:
+    - CPU tensors: shared memory (share_memory_())
+    - GPU tensors: CUDA IPC handles (zero-copy)
+    """
+
+    def __init__(self, send_queue, recv_queue):
+        """
+        Initialize with send and receive queues.
+
+        Args:
+            send_queue: Queue for sending messages (to remote)
+            recv_queue: Queue for receiving messages (from remote)
+        """
+        self._send = send_queue
+        self._recv = recv_queue
+
+    def send(self, obj: Any) -> None:
+        """Send an object to the remote endpoint."""
+        self._send.put(obj)
+
+    def recv(self, timeout: Optional[float] = None) -> Any:
+        """
+        Receive an object from the remote endpoint.
+
+        Args:
+            timeout: Timeout in seconds (None = block forever)
+
+        Returns:
+            Received object
+
+        Raises:
+            Empty: If timeout expires with no message
+        """
+        import queue
+        try:
+            return self._recv.get(timeout=timeout)
+        except queue.Empty:
+            raise
+
+    def close(self) -> None:
+        """Close the transport (no-op for queues, cleanup handled by creator)."""
+        pass
 
 
 class UnixSocketTransport:

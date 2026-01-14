@@ -33,13 +33,14 @@ Usage:
 
 from .base import Worker
 from .torch_mp import TorchMPWorker
-from .venv import VenvWorker
+from .venv import VenvWorker, PersistentVenvWorker
 from .pool import WorkerPool, get_worker, register_worker, shutdown_workers, list_workers
 
 __all__ = [
     "Worker",
     "TorchMPWorker",
     "VenvWorker",
+    "PersistentVenvWorker",
     "WorkerPool",
     "get_worker",
     "register_worker",

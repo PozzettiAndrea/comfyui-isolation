@@ -412,386 +412,55 @@ class VenvWorker(Worker):
         return f"<VenvWorker name={self.name!r} python={self.python}>"
 
 
-class PersistentVenvWorker(Worker):
+def _queue_worker_entrypoint(to_host_queue, from_host_queue, shm_dir, sys_paths):
     """
-    Persistent version of VenvWorker that keeps subprocess alive.
+    Worker process entrypoint using queue-based IPC.
 
-    This reduces per-call overhead by ~200-400ms by avoiding subprocess spawn.
-    Uses Unix Domain Sockets for communication (similar to original decorator approach,
-    but simpler and more explicit).
+    This function runs in the isolated venv subprocess and handles
+    requests from the host process.
 
-    Use this for high-frequency calls to the same venv.
+    Args:
+        to_host_queue: Queue for sending messages to host (worker -> host)
+        from_host_queue: Queue for receiving messages from host (host -> worker)
+        shm_dir: Shared memory directory for tensor files
+        sys_paths: List of paths to add to sys.path
     """
-
-    def __init__(
-        self,
-        python: Union[str, Path],
-        working_dir: Optional[Union[str, Path]] = None,
-        sys_path: Optional[List[str]] = None,
-        env: Optional[Dict[str, str]] = None,
-        name: Optional[str] = None,
-    ):
-        """
-        Initialize persistent worker.
-
-        Args:
-            python: Path to Python executable in target venv.
-            working_dir: Working directory for subprocess.
-            sys_path: Additional paths to add to sys.path.
-            env: Additional environment variables.
-            name: Optional name for logging.
-        """
-        self.python = Path(python)
-        self.working_dir = Path(working_dir) if working_dir else Path.cwd()
-        self.sys_path = sys_path or []
-        self.extra_env = env or {}
-        self.name = name or f"PersistentVenvWorker({self.python.parent.parent.name})"
-
-        if not self.python.exists():
-            raise FileNotFoundError(f"Python not found: {self.python}")
-
-        self._temp_dir = Path(tempfile.mkdtemp(prefix='comfyui_pvenv_'))
-        self._shm_dir = _get_shm_dir()
-        self._process: Optional[subprocess.Popen] = None
-        self._socket_path: Optional[Path] = None
-        self._transport = None
-        self._shutdown = False
-        self._lock = threading.Lock()
-
-    def _find_comfyui_base(self) -> Optional[Path]:
-        """Find ComfyUI base directory by walking up from working_dir."""
-        current = self.working_dir.resolve()
-        for _ in range(10):
-            if (current / "main.py").exists() and (current / "comfy").exists():
-                return current
-            current = current.parent
-        return None
-
-    def _ensure_started(self):
-        """Start persistent worker process if not running."""
-        if self._shutdown:
-            raise RuntimeError(f"{self.name}: Worker has been shut down")
-
-        if self._process is not None and self._process.poll() is None:
-            return  # Already running
-
-        # Import transport (reuse from existing code)
-        from ..ipc.transport import UnixSocketTransport, cleanup_socket
-
-        import socket
-
-        # Create socket
-        self._socket_path = self._temp_dir / "worker.sock"
-        cleanup_socket(str(self._socket_path))
-
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(str(self._socket_path))
-        server.listen(1)
-        server.settimeout(30)
-
-        # Write and run persistent worker script
-        worker_script = self._temp_dir / "persistent_worker.py"
-        worker_script.write_text(_PERSISTENT_WORKER_SCRIPT)
-
-        env = os.environ.copy()
-        env.update(self.extra_env)
-        env["COMFYUI_ISOLATION_WORKER"] = "1"
-
-        # Find ComfyUI base and set env var for folder_paths stub
-        comfyui_base = self._find_comfyui_base()
-        if comfyui_base:
-            env["COMFYUI_BASE"] = str(comfyui_base)
-
-        # Add stubs directory to sys_path for folder_paths etc.
-        stubs_dir = Path(__file__).parent.parent / "stubs"
-        all_sys_path = [str(stubs_dir), str(self.working_dir)] + self.sys_path
-
-        self._process = subprocess.Popen(
-            [
-                str(self.python),
-                str(worker_script),
-                str(self._socket_path),
-                str(self._shm_dir),
-                json.dumps(all_sys_path),
-            ],
-            cwd=str(self.working_dir),
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-
-        # Start stderr forwarding
-        def forward_stderr():
-            for line in self._process.stderr:
-                print(f"[{self.name}] {line.decode('utf-8', errors='replace').rstrip()}")
-
-        threading.Thread(target=forward_stderr, daemon=True).start()
-
-        # Wait for connection
-        try:
-            conn, _ = server.accept()
-        except socket.timeout:
-            self._process.kill()
-            raise RuntimeError(f"{self.name}: Worker failed to connect")
-        finally:
-            server.close()
-
-        self._transport = UnixSocketTransport(conn)
-
-        # Wait for ready
-        msg = self._transport.recv()
-        if msg.get("status") != "ready":
-            raise RuntimeError(f"{self.name}: Unexpected ready message: {msg}")
-
-    def call(
-        self,
-        func: Callable,
-        *args,
-        timeout: Optional[float] = None,
-        **kwargs
-    ) -> Any:
-        """Not supported - use call_module()."""
-        raise NotImplementedError(
-            f"{self.name}: Use call_module(module='...', func='...') instead."
-        )
-
-    def call_method(
-        self,
-        module_name: str,
-        class_name: str,
-        method_name: str,
-        self_state: Optional[Dict[str, Any]] = None,
-        kwargs: Optional[Dict[str, Any]] = None,
-        timeout: Optional[float] = None,
-    ) -> Any:
-        """
-        Call a class method by module/class/method path.
-
-        Args:
-            module_name: Module containing the class (e.g., "depth_estimate").
-            class_name: Class name (e.g., "SAM3D_DepthEstimate").
-            method_name: Method name (e.g., "estimate_depth").
-            self_state: Optional dict to populate instance __dict__.
-            kwargs: Keyword arguments for the method.
-            timeout: Timeout in seconds.
-
-        Returns:
-            Return value of the method.
-        """
-        with self._lock:
-            self._ensure_started()
-
-            timeout = timeout or 600.0
-            call_id = str(uuid.uuid4())[:8]
-
-            import torch
-            inputs_path = self._shm_dir / f"comfyui_pvenv_{call_id}_in.pt"
-            outputs_path = self._shm_dir / f"comfyui_pvenv_{call_id}_out.pt"
-
-            try:
-                # Serialize kwargs
-                if kwargs:
-                    serialized_kwargs = _serialize_for_ipc(kwargs)
-                    torch.save(serialized_kwargs, str(inputs_path))
-
-                # Send request with class info
-                request = {
-                    "type": "call_method",
-                    "module": module_name,
-                    "class_name": class_name,
-                    "method_name": method_name,
-                    "self_state": self_state,
-                    "inputs_path": str(inputs_path) if kwargs else None,
-                    "outputs_path": str(outputs_path),
-                }
-                self._transport.send(request)
-
-                # Wait for response
-                import select
-                ready, _, _ = select.select([self._transport.fileno()], [], [], timeout)
-
-                if not ready:
-                    self._process.kill()
-                    self._shutdown = True
-                    raise TimeoutError(f"{self.name}: Call timed out")
-
-                response = self._transport.recv()
-
-                if response.get("status") == "error":
-                    raise WorkerError(
-                        response.get("error", "Unknown"),
-                        traceback=response.get("traceback"),
-                    )
-
-                if outputs_path.exists():
-                    return torch.load(str(outputs_path), weights_only=False)
-                return None
-
-            finally:
-                for p in [inputs_path, outputs_path]:
-                    try:
-                        p.unlink()
-                    except:
-                        pass
-
-    def call_module(
-        self,
-        module: str,
-        func: str,
-        timeout: Optional[float] = None,
-        **kwargs
-    ) -> Any:
-        """Call a function by module path."""
-        with self._lock:
-            self._ensure_started()
-
-            timeout = timeout or 600.0
-            call_id = str(uuid.uuid4())[:8]
-
-            # Save inputs
-            import torch
-            inputs_path = self._shm_dir / f"comfyui_pvenv_{call_id}_in.pt"
-            outputs_path = self._shm_dir / f"comfyui_pvenv_{call_id}_out.pt"
-
-            try:
-                if kwargs:
-                    serialized_kwargs = _serialize_for_ipc(kwargs)
-                    torch.save(serialized_kwargs, str(inputs_path))
-
-                # Send request
-                request = {
-                    "type": "call_module",
-                    "module": module,
-                    "func": func,
-                    "inputs_path": str(inputs_path) if kwargs else None,
-                    "outputs_path": str(outputs_path),
-                }
-                self._transport.send(request)
-
-                # Wait for response with timeout
-                import select
-                ready, _, _ = select.select([self._transport.fileno()], [], [], timeout)
-
-                if not ready:
-                    self._process.kill()
-                    self._shutdown = True
-                    raise TimeoutError(f"{self.name}: Call timed out")
-
-                response = self._transport.recv()
-
-                if response.get("status") == "error":
-                    raise WorkerError(
-                        response.get("error", "Unknown"),
-                        traceback=response.get("traceback"),
-                    )
-
-                # Load result
-                if outputs_path.exists():
-                    return torch.load(str(outputs_path), weights_only=False)
-                return None
-
-            finally:
-                for p in [inputs_path, outputs_path]:
-                    try:
-                        p.unlink()
-                    except:
-                        pass
-
-    def shutdown(self) -> None:
-        """Shut down the persistent worker."""
-        if self._shutdown:
-            return
-        self._shutdown = True
-
-        if self._transport:
-            try:
-                self._transport.send({"method": "shutdown"})
-            except:
-                pass
-            self._transport.close()
-
-        if self._process:
-            self._process.wait(timeout=5)
-            if self._process.poll() is None:
-                self._process.kill()
-
-        shutil.rmtree(self._temp_dir, ignore_errors=True)
-
-    def is_alive(self) -> bool:
-        if self._shutdown:
-            return False
-        if self._process is None:
-            return False
-        return self._process.poll() is None
-
-    def __repr__(self):
-        status = "alive" if self.is_alive() else "stopped"
-        return f"<PersistentVenvWorker name={self.name!r} status={status}>"
-
-
-# Script for persistent worker subprocess
-_PERSISTENT_WORKER_SCRIPT = '''
-import sys
-import json
-import socket
-import struct
-import traceback
-from types import SimpleNamespace
-
-def _deserialize_isolated_objects(obj):
-    """Reconstruct objects serialized with __isolated_object__ marker."""
-    if isinstance(obj, dict):
-        if obj.get("__isolated_object__"):
-            # Reconstruct as SimpleNamespace (supports .attr access)
-            attrs = {k: _deserialize_isolated_objects(v) for k, v in obj.get("__attrs__", {}).items()}
-            ns = SimpleNamespace(**attrs)
-            ns.__class_name__ = obj.get("__class_name__", "Unknown")
-            return ns
-        return {k: _deserialize_isolated_objects(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [_deserialize_isolated_objects(v) for v in obj]
-    elif isinstance(obj, tuple):
-        return tuple(_deserialize_isolated_objects(v) for v in obj)
-    return obj
-
-def main():
-    socket_path = sys.argv[1]
-    shm_dir = sys.argv[2]
-    sys_paths = json.loads(sys.argv[3])
+    import sys
+    import traceback
+    from pathlib import Path
+    from types import SimpleNamespace
 
     # Setup paths
     for p in sys_paths:
         if p not in sys.path:
             sys.path.insert(0, p)
 
-    # Connect to host
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(socket_path)
-
-    def send(obj):
-        data = json.dumps(obj).encode()
-        sock.sendall(struct.pack(">I", len(data)) + data)
-
-    def recv():
-        header = sock.recv(4)
-        if not header:
-            return None
-        length = struct.unpack(">I", header)[0]
-        data = b""
-        while len(data) < length:
-            chunk = sock.recv(length - len(data))
-            if not chunk:
-                break
-            data += chunk
-        return json.loads(data)
+    def _deserialize_isolated_objects(obj):
+        """Reconstruct objects serialized with __isolated_object__ marker."""
+        if isinstance(obj, dict):
+            if obj.get("__isolated_object__"):
+                attrs = {k: _deserialize_isolated_objects(v) for k, v in obj.get("__attrs__", {}).items()}
+                ns = SimpleNamespace(**attrs)
+                ns.__class_name__ = obj.get("__class_name__", "Unknown")
+                return ns
+            return {k: _deserialize_isolated_objects(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [_deserialize_isolated_objects(v) for v in obj]
+        elif isinstance(obj, tuple):
+            return tuple(_deserialize_isolated_objects(v) for v in obj)
+        return obj
 
     # Signal ready
-    send({"status": "ready"})
+    to_host_queue.put({"status": "ready"})
 
     import torch
 
     while True:
-        request = recv()
+        try:
+            request = from_host_queue.get()
+        except Exception:
+            break
+
         if request is None or request.get("method") == "shutdown":
             break
 
@@ -833,17 +502,332 @@ def main():
             if outputs_path:
                 torch.save(result, outputs_path)
 
-            send({"status": "ok"})
+            to_host_queue.put({"status": "ok"})
 
         except Exception as e:
-            send({
+            to_host_queue.put({
                 "status": "error",
                 "error": str(e),
                 "traceback": traceback.format_exc(),
             })
 
-    sock.close()
 
-if __name__ == "__main__":
-    main()
-'''
+class PersistentVenvWorker(Worker):
+    """
+    Persistent version of VenvWorker that keeps subprocess alive.
+
+    This reduces per-call overhead by ~200-400ms by avoiding subprocess spawn.
+    Uses multiprocessing.Queue for cross-platform communication with zero-copy
+    tensor transfer support.
+
+    Use this for high-frequency calls to the same venv.
+    """
+
+    def __init__(
+        self,
+        python: Union[str, Path],
+        working_dir: Optional[Union[str, Path]] = None,
+        sys_path: Optional[List[str]] = None,
+        env: Optional[Dict[str, str]] = None,
+        name: Optional[str] = None,
+        share_torch: bool = True,
+    ):
+        """
+        Initialize persistent worker.
+
+        Args:
+            python: Path to Python executable in target venv.
+            working_dir: Working directory for subprocess.
+            sys_path: Additional paths to add to sys.path.
+            env: Additional environment variables.
+            name: Optional name for logging.
+            share_torch: Use torch.multiprocessing for zero-copy tensor transfer.
+        """
+        self.python = Path(python)
+        self.working_dir = Path(working_dir) if working_dir else Path.cwd()
+        self.sys_path = sys_path or []
+        self.extra_env = env or {}
+        self.name = name or f"PersistentVenvWorker({self.python.parent.parent.name})"
+        self.share_torch = share_torch
+
+        if not self.python.exists():
+            raise FileNotFoundError(f"Python not found: {self.python}")
+
+        self._temp_dir = Path(tempfile.mkdtemp(prefix='comfyui_pvenv_'))
+        self._shm_dir = _get_shm_dir()
+        self._process = None  # Will be multiprocessing.Process
+        self._to_worker = None  # Queue: host -> worker
+        self._from_worker = None  # Queue: worker -> host
+        self._transport = None
+        self._shutdown = False
+        self._lock = threading.Lock()
+        self._mp = None  # multiprocessing module reference
+
+    def _find_comfyui_base(self) -> Optional[Path]:
+        """Find ComfyUI base directory by walking up from working_dir."""
+        current = self.working_dir.resolve()
+        for _ in range(10):
+            if (current / "main.py").exists() and (current / "comfy").exists():
+                return current
+            current = current.parent
+        return None
+
+    def _ensure_started(self):
+        """Start persistent worker process if not running."""
+        if self._shutdown:
+            raise RuntimeError(f"{self.name}: Worker has been shut down")
+
+        if self._process is not None and self._process.is_alive():
+            return  # Already running
+
+        from ..ipc.transport import create_queue_pair, QueueTransport
+
+        # Create queue pair for bidirectional communication
+        self._to_worker, self._from_worker, self._mp = create_queue_pair(
+            share_torch=self.share_torch
+        )
+
+        # Set up environment
+        env = os.environ.copy()
+        env.update(self.extra_env)
+        env["COMFYUI_ISOLATION_WORKER"] = "1"
+
+        # Find ComfyUI base and set env var for folder_paths stub
+        comfyui_base = self._find_comfyui_base()
+        if comfyui_base:
+            env["COMFYUI_BASE"] = str(comfyui_base)
+
+        # Add stubs directory to sys_path for folder_paths etc.
+        stubs_dir = Path(__file__).parent.parent / "stubs"
+        all_sys_path = [str(stubs_dir), str(self.working_dir)] + self.sys_path
+
+        # On Windows, set VIRTUAL_ENV for proper venv activation
+        if os.name == "nt":
+            env["VIRTUAL_ENV"] = str(self.python.parent.parent)
+
+        # Set the Python executable for multiprocessing
+        self._mp.set_executable(str(self.python))
+
+        # Launch worker process
+        self._process = self._mp.Process(
+            target=_queue_worker_entrypoint,
+            args=(
+                self._to_worker,
+                self._from_worker,
+                str(self._shm_dir),
+                all_sys_path,
+            ),
+        )
+        self._process.start()
+
+        # Create transport wrapper
+        self._transport = QueueTransport(self._to_worker, self._from_worker)
+
+        # Wait for ready signal
+        try:
+            msg = self._transport.recv(timeout=30)
+        except Exception:
+            if self._process.is_alive():
+                self._process.terminate()
+            raise RuntimeError(f"{self.name}: Worker failed to start (timeout)")
+
+        if msg.get("status") != "ready":
+            raise RuntimeError(f"{self.name}: Unexpected ready message: {msg}")
+
+    def call(
+        self,
+        func: Callable,
+        *args,
+        timeout: Optional[float] = None,
+        **kwargs
+    ) -> Any:
+        """Not supported - use call_module()."""
+        raise NotImplementedError(
+            f"{self.name}: Use call_module(module='...', func='...') instead."
+        )
+
+    def call_method(
+        self,
+        module_name: str,
+        class_name: str,
+        method_name: str,
+        self_state: Optional[Dict[str, Any]] = None,
+        kwargs: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """
+        Call a class method by module/class/method path.
+
+        Args:
+            module_name: Module containing the class (e.g., "depth_estimate").
+            class_name: Class name (e.g., "SAM3D_DepthEstimate").
+            method_name: Method name (e.g., "estimate_depth").
+            self_state: Optional dict to populate instance __dict__.
+            kwargs: Keyword arguments for the method.
+            timeout: Timeout in seconds.
+
+        Returns:
+            Return value of the method.
+        """
+        import queue as queue_module
+
+        with self._lock:
+            self._ensure_started()
+
+            timeout = timeout or 600.0
+            call_id = str(uuid.uuid4())[:8]
+
+            import torch
+            inputs_path = self._shm_dir / f"comfyui_pvenv_{call_id}_in.pt"
+            outputs_path = self._shm_dir / f"comfyui_pvenv_{call_id}_out.pt"
+
+            try:
+                # Serialize kwargs
+                if kwargs:
+                    serialized_kwargs = _serialize_for_ipc(kwargs)
+                    torch.save(serialized_kwargs, str(inputs_path))
+
+                # Send request with class info
+                request = {
+                    "type": "call_method",
+                    "module": module_name,
+                    "class_name": class_name,
+                    "method_name": method_name,
+                    "self_state": self_state,
+                    "inputs_path": str(inputs_path) if kwargs else None,
+                    "outputs_path": str(outputs_path),
+                }
+                self._transport.send(request)
+
+                # Wait for response with timeout
+                try:
+                    response = self._transport.recv(timeout=timeout)
+                except queue_module.Empty:
+                    self._process.terminate()
+                    self._shutdown = True
+                    raise TimeoutError(f"{self.name}: Call timed out")
+
+                if response.get("status") == "error":
+                    raise WorkerError(
+                        response.get("error", "Unknown"),
+                        traceback=response.get("traceback"),
+                    )
+
+                if outputs_path.exists():
+                    return torch.load(str(outputs_path), weights_only=False)
+                return None
+
+            finally:
+                for p in [inputs_path, outputs_path]:
+                    try:
+                        p.unlink()
+                    except:
+                        pass
+
+    def call_module(
+        self,
+        module: str,
+        func: str,
+        timeout: Optional[float] = None,
+        **kwargs
+    ) -> Any:
+        """Call a function by module path."""
+        import queue as queue_module
+
+        with self._lock:
+            self._ensure_started()
+
+            timeout = timeout or 600.0
+            call_id = str(uuid.uuid4())[:8]
+
+            # Save inputs
+            import torch
+            inputs_path = self._shm_dir / f"comfyui_pvenv_{call_id}_in.pt"
+            outputs_path = self._shm_dir / f"comfyui_pvenv_{call_id}_out.pt"
+
+            try:
+                if kwargs:
+                    serialized_kwargs = _serialize_for_ipc(kwargs)
+                    torch.save(serialized_kwargs, str(inputs_path))
+
+                # Send request
+                request = {
+                    "type": "call_module",
+                    "module": module,
+                    "func": func,
+                    "inputs_path": str(inputs_path) if kwargs else None,
+                    "outputs_path": str(outputs_path),
+                }
+                self._transport.send(request)
+
+                # Wait for response with timeout
+                try:
+                    response = self._transport.recv(timeout=timeout)
+                except queue_module.Empty:
+                    self._process.terminate()
+                    self._shutdown = True
+                    raise TimeoutError(f"{self.name}: Call timed out")
+
+                if response.get("status") == "error":
+                    raise WorkerError(
+                        response.get("error", "Unknown"),
+                        traceback=response.get("traceback"),
+                    )
+
+                # Load result
+                if outputs_path.exists():
+                    return torch.load(str(outputs_path), weights_only=False)
+                return None
+
+            finally:
+                for p in [inputs_path, outputs_path]:
+                    try:
+                        p.unlink()
+                    except:
+                        pass
+
+    def shutdown(self) -> None:
+        """Shut down the persistent worker."""
+        if self._shutdown:
+            return
+        self._shutdown = True
+
+        # Send shutdown signal via queue
+        if self._transport:
+            try:
+                self._transport.send({"method": "shutdown"})
+            except:
+                pass
+            self._transport.close()
+
+        # Wait for process to exit
+        if self._process:
+            self._process.join(timeout=5)
+            if self._process.is_alive():
+                self._process.terminate()
+                self._process.join(timeout=2)
+
+        # Clean up queues
+        if self._to_worker:
+            try:
+                self._to_worker.close()
+            except:
+                pass
+        if self._from_worker:
+            try:
+                self._from_worker.close()
+            except:
+                pass
+
+        shutil.rmtree(self._temp_dir, ignore_errors=True)
+
+    def is_alive(self) -> bool:
+        if self._shutdown:
+            return False
+        if self._process is None:
+            return False
+        return self._process.is_alive()
+
+    def __repr__(self):
+        status = "alive" if self.is_alive() else "stopped"
+        return f"<PersistentVenvWorker name={self.name!r} status={status}>"
