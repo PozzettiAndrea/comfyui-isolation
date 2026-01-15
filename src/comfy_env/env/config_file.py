@@ -168,7 +168,7 @@ def _get_default_pytorch_version(cuda_version: Optional[str]) -> str:
         - CUDA 12.8 (Turing+): PyTorch 2.8.0
     """
     if cuda_version == "12.4":
-        return "2.5.1"  # Legacy: Pascal GPUs
+        return "2.5.1"  # Full: Pascal GPUs
     return "2.8.0"  # Modern: Turing through Blackwell
 
 
@@ -176,7 +176,7 @@ def _parse_config(data: Dict[str, Any], base_dir: Path) -> IsolatedEnv:
     """
     Parse TOML data into IsolatedEnv.
 
-    Supports both simplified and legacy config formats:
+    Supports both simplified and full config formats:
 
     Simplified (CUDA packages only):
         [packages]
@@ -186,7 +186,7 @@ def _parse_config(data: Dict[str, Any], base_dir: Path) -> IsolatedEnv:
     Or as list:
         packages = ["torch-scatter==2.1.2", "torch-cluster==1.6.3"]
 
-    Legacy:
+    Full:
         [env]
         name = "my-node"
         [packages]
@@ -233,7 +233,7 @@ def _parse_config(data: Dict[str, Any], base_dir: Path) -> IsolatedEnv:
         variables.setdefault("pytorch_mm", pytorch_mm)
 
     # Parse CUDA packages - support multiple formats
-    # Priority: [cuda] section > cuda = [...] > legacy [packages] section
+    # Priority: [cuda] section > cuda = [...] > [packages] section
     no_deps_requirements = []
     requirements = []
 
@@ -258,12 +258,12 @@ def _parse_config(data: Dict[str, Any], base_dir: Path) -> IsolatedEnv:
 
     elif isinstance(packages_section, dict):
         # Check for simplified format: [packages] with key=value pairs
-        # vs legacy format: [packages] with requirements/no_deps lists
+        # vs old format: [packages] with requirements/no_deps lists
 
-        has_legacy_keys = any(k in packages_section for k in ["requirements", "no_deps", "requirements_file"])
+        has_old_keys = any(k in packages_section for k in ["requirements", "no_deps", "requirements_file"])
 
-        if has_legacy_keys:
-            # Legacy format
+        if has_old_keys:
+            # Old format
             raw_requirements = packages_section.get("requirements", [])
             requirements = [_substitute_vars(req, variables) for req in raw_requirements]
 
@@ -340,9 +340,9 @@ def load_config(
     base_dir: Optional[Path] = None,
 ) -> EnvManagerConfig:
     """
-    Load full EnvManagerConfig from a TOML file (v2 schema).
+    Load full EnvManagerConfig from a TOML file.
 
-    Supports both v2 schema and legacy format (auto-detected).
+    Supports both full schema (named envs) and simple format (auto-detected).
 
     Args:
         path: Path to the TOML config file
@@ -373,7 +373,7 @@ def load_config(
     with open(path, "rb") as f:
         data = tomllib.load(f)
 
-    return _parse_config_v2(data, base_dir)
+    return _parse_full_config(data, base_dir)
 
 
 def discover_config(
@@ -404,9 +404,9 @@ def discover_config(
     return None
 
 
-def _parse_config_v2(data: Dict[str, Any], base_dir: Path) -> EnvManagerConfig:
+def _parse_full_config(data: Dict[str, Any], base_dir: Path) -> EnvManagerConfig:
     """
-    Parse TOML data into EnvManagerConfig (v2 schema).
+    Parse TOML data into EnvManagerConfig.
 
     Schema:
         [local.cuda]        - CUDA packages for host
@@ -416,16 +416,16 @@ def _parse_config_v2(data: Dict[str, Any], base_dir: Path) -> EnvManagerConfig:
         [envname.packages]  - Packages for env
         [node_reqs]         - Node dependencies
 
-    Also supports legacy format for backward compatibility.
+    Also supports simple format ([env] + [packages]) for backward compatibility.
     """
-    # Detect if this is v2 schema or legacy
-    is_v2 = "local" in data or _has_named_env(data)
+    # Detect if this is full schema or simple format
+    is_full = "local" in data or _has_named_env(data)
 
-    if not is_v2:
-        # Legacy format - convert to v2 structure
-        return _convert_legacy_to_v2(data, base_dir)
+    if not is_full:
+        # Simple format - convert to full structure
+        return _convert_simple_to_full(data, base_dir)
 
-    # Parse v2 schema
+    # Parse full schema
     local = _parse_local_section(data.get("local", {}))
     envs = _parse_env_sections(data, base_dir)
     node_reqs = _parse_node_reqs(data.get("node_reqs", {}))
@@ -580,3 +580,43 @@ def _parse_node_reqs(node_reqs_data: Dict[str, Any]) -> List[NodeReq]:
             reqs.append(NodeReq(name=name, repo=repo))
 
     return reqs
+
+
+def _convert_simple_to_full(data: Dict[str, Any], base_dir: Path) -> EnvManagerConfig:
+    """Convert simple config format to full EnvManagerConfig.
+
+    Simple configs have [env] and [packages] sections but no named environments.
+    This converts them to the full format with a single named environment.
+    """
+    # Parse using simple parser to get IsolatedEnv
+    simple_env = _parse_config(data, base_dir)
+
+    # Check if this has explicit env settings (isolated venv) vs just CUDA packages (local install)
+    env_section = data.get("env", {})
+    has_explicit_env = bool(env_section.get("name") or env_section.get("python"))
+
+    if has_explicit_env:
+        # Isolated venv config
+        return EnvManagerConfig(
+            local=LocalConfig(),
+            envs={simple_env.name: simple_env},
+            node_reqs=[],
+        )
+    else:
+        # Local CUDA packages only (no isolated venv)
+        cuda_packages = {}
+        for req in simple_env.no_deps_requirements:
+            if "==" in req:
+                pkg, ver = req.split("==", 1)
+                cuda_packages[pkg] = ver
+            else:
+                cuda_packages[req] = ""
+
+        return EnvManagerConfig(
+            local=LocalConfig(
+                cuda_packages=cuda_packages,
+                requirements=simple_env.requirements,
+            ),
+            envs={},
+            node_reqs=[],
+        )

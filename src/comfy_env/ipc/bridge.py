@@ -48,10 +48,6 @@ class WorkerBridge:
         result = bridge.call("process", image=my_image)
     """
 
-    # Singleton instances by environment hash
-    _instances: Dict[str, "WorkerBridge"] = {}
-    _instances_lock = threading.Lock()
-
     def __init__(
         self,
         env: IsolatedEnv,
@@ -80,38 +76,6 @@ class WorkerBridge:
         self._process: Optional[subprocess.Popen] = None
         self._process_lock = threading.Lock()
         self._stderr_thread: Optional[threading.Thread] = None
-
-    @classmethod
-    def get_instance(
-        cls,
-        env: IsolatedEnv,
-        worker_script: Path,
-        base_dir: Optional[Path] = None,
-        log_callback: Optional[Callable[[str], None]] = None,
-    ) -> "WorkerBridge":
-        """
-        Get or create a singleton bridge instance for an environment.
-
-        Args:
-            env: Isolated environment configuration
-            worker_script: Path to the worker Python script
-            base_dir: Base directory for environments
-            log_callback: Optional callback for logging
-
-        Returns:
-            WorkerBridge instance (reused if same env hash)
-        """
-        env_hash = env.get_env_hash()
-
-        with cls._instances_lock:
-            if env_hash not in cls._instances:
-                cls._instances[env_hash] = cls(
-                    env=env,
-                    worker_script=worker_script,
-                    base_dir=base_dir,
-                    log_callback=log_callback,
-                )
-            return cls._instances[env_hash]
 
     @classmethod
     def from_config_file(
