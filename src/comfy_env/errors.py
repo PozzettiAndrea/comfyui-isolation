@@ -291,35 +291,3 @@ class InstallError(EnvManagerError):
 
         details = "\n".join(details_parts) if details_parts else None
         super().__init__(message, details)
-
-
-def format_environment_mismatch(
-    expected: "RuntimeEnv",
-    actual: "RuntimeEnv",
-) -> str:
-    """
-    Format a message explaining environment mismatch.
-
-    Used when the current environment doesn't match what's needed.
-    """
-    mismatches = []
-
-    if expected.cuda_version != actual.cuda_version:
-        mismatches.append(
-            f"  CUDA: expected {expected.cuda_version}, got {actual.cuda_version}"
-        )
-
-    if expected.torch_version != actual.torch_version:
-        mismatches.append(
-            f"  PyTorch: expected {expected.torch_version}, got {actual.torch_version}"
-        )
-
-    if expected.python_version != actual.python_version:
-        mismatches.append(
-            f"  Python: expected {expected.python_version}, got {actual.python_version}"
-        )
-
-    if not mismatches:
-        return "Environment matches expected configuration"
-
-    return "Environment mismatch:\n" + "\n".join(mismatches)

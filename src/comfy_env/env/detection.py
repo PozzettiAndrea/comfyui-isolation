@@ -92,22 +92,6 @@ def is_blackwell_gpu(name: str, compute_cap: str) -> bool:
     return False
 
 
-def needs_cuda_128() -> bool:
-    """
-    Check if any detected GPU requires CUDA 12.8.
-
-    Returns:
-        True if Blackwell GPU detected, False otherwise.
-    """
-    gpus = detect_gpu_info()
-
-    for gpu in gpus:
-        if is_blackwell_gpu(gpu["name"], gpu["compute_cap"]):
-            return True
-
-    return False
-
-
 def is_legacy_gpu(compute_cap: str) -> bool:
     """
     Check if GPU is Pascal or older (requires legacy CUDA/PyTorch).
