@@ -52,6 +52,10 @@ class _ModuleProxy:
         base = _find_comfyui_base()
         return str(base / "input") if base else None
 
+    def get_temp_directory(self):
+        base = _find_comfyui_base()
+        return str(base / "temp") if base else None
+
 # Replace module with proxy instance
 import sys
 sys.modules[__name__] = _ModuleProxy()
