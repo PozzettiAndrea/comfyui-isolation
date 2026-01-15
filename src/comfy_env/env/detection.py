@@ -7,8 +7,14 @@ vs older GPUs which use CUDA 12.4.
 This runs BEFORE PyTorch is installed, so we use nvidia-smi directly.
 """
 
+import os
 import subprocess
 from typing import List, Dict, Optional
+
+
+# Environment variable to override CUDA version detection
+# Useful for CI environments without GPU
+CUDA_VERSION_ENV_VAR = "COMFY_ENV_CUDA_VERSION"
 
 
 def detect_gpu_info() -> List[Dict[str, str]]:
@@ -126,7 +132,12 @@ def detect_cuda_version() -> Optional[str]:
     Returns:
         "12.4" for Pascal or older (compute < 7.5),
         "12.8" for Turing or newer (compute >= 7.5),
-        None if no GPU detected.
+        None if no GPU detected and no env var override.
+
+    Environment Variable Override:
+        Set COMFY_ENV_CUDA_VERSION to override auto-detection.
+        Useful for CI environments without GPU.
+        Example: COMFY_ENV_CUDA_VERSION=12.8
 
     GPU Architecture Reference:
         - Pascal (GTX 10xx, P100): compute 6.0-6.1 → CUDA 12.4
@@ -138,6 +149,15 @@ def detect_cuda_version() -> Optional[str]:
     """
     gpus = detect_gpu_info()
     if not gpus:
+        # No GPU detected - check for env var override
+        override = os.environ.get(CUDA_VERSION_ENV_VAR)
+        if override:
+            # Normalize format (e.g., "12.8" or "128" -> "12.8")
+            override = override.strip()
+            if override and '.' not in override and len(override) >= 2:
+                # Convert "128" -> "12.8"
+                override = f"{override[:-1]}.{override[-1]}"
+            return override
         return None
 
     # Check if any GPU is legacy (Pascal or older)
@@ -159,7 +179,10 @@ def get_gpu_summary() -> str:
     gpus = detect_gpu_info()
 
     if not gpus:
-        return "No NVIDIA GPU detected"
+        override = os.environ.get(CUDA_VERSION_ENV_VAR)
+        if override:
+            return f"No NVIDIA GPU detected (using {CUDA_VERSION_ENV_VAR}={override})"
+        return f"No NVIDIA GPU detected (set {CUDA_VERSION_ENV_VAR} to override)"
 
     lines = []
     for i, gpu in enumerate(gpus):
