@@ -12,10 +12,10 @@ Example:
     install()
 
     # In-place with explicit config
-    install(config="comfyui_env.toml", mode="inplace")
+    install(config="comfy-env.toml", mode="inplace")
 
     # Isolated environment
-    install(config="comfyui_env.toml", mode="isolated")
+    install(config="comfy-env.toml", mode="isolated")
 """
 
 import shutil
@@ -42,7 +42,7 @@ def install(
     verify_wheels: bool = False,
 ) -> bool:
     """
-    Install dependencies from a comfyui_env.toml configuration.
+    Install dependencies from a comfy-env.toml configuration.
 
     This is the main entry point for installing CUDA dependencies.
 
@@ -67,7 +67,7 @@ def install(
         install()
 
         # Explicit config file
-        install(config="comfyui_env.toml")
+        install(config="comfy-env.toml")
 
         # Isolated mode
         install(mode="isolated")
@@ -83,7 +83,7 @@ def install(
     if full_config is None:
         raise FileNotFoundError(
             "No configuration file found. "
-            "Create comfyui_env.toml or specify path explicitly."
+            "Create comfy-env.toml or specify path explicitly."
         )
 
     # Install tools first (e.g., Blender)

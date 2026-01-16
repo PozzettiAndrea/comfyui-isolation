@@ -40,7 +40,7 @@ _SHUTDOWN = object()
 _CALL_METHOD = "call_method"
 
 
-def _worker_loop(queue_in, queue_out):
+def _worker_loop(queue_in, queue_out, sys_path_additions=None):
     """
     Worker process main loop.
 
@@ -54,9 +54,21 @@ def _worker_loop(queue_in, queue_out):
     import importlib
     import os
     import sys
+    from pathlib import Path
 
     # Set worker mode env var
     os.environ["COMFYUI_ISOLATION_WORKER"] = "1"
+
+    # Add stubs directory for folder_paths etc. (same as PersistentVenvWorker)
+    stubs_dir = Path(__file__).parent.parent / "stubs"
+    if str(stubs_dir) not in sys.path:
+        sys.path.insert(0, str(stubs_dir))
+
+    # Add custom paths to sys.path for module discovery
+    if sys_path_additions:
+        for path in sys_path_additions:
+            if path not in sys.path:
+                sys.path.insert(0, path)
 
     while True:
         try:
@@ -151,14 +163,16 @@ class TorchMPWorker(Worker):
     interpreter without inherited state from the parent.
     """
 
-    def __init__(self, name: Optional[str] = None):
+    def __init__(self, name: Optional[str] = None, sys_path: Optional[list] = None):
         """
         Initialize the worker.
 
         Args:
             name: Optional name for logging/debugging.
+            sys_path: Optional list of paths to add to sys.path in worker process.
         """
         self.name = name or "TorchMPWorker"
+        self._sys_path = sys_path or []
         self._process = None
         self._queue_in = None
         self._queue_out = None
@@ -185,7 +199,7 @@ class TorchMPWorker(Worker):
         self._queue_out = ctx.Queue()
         self._process = ctx.Process(
             target=_worker_loop,
-            args=(self._queue_in, self._queue_out),
+            args=(self._queue_in, self._queue_out, self._sys_path),
             daemon=True,
         )
         self._process.start()

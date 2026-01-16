@@ -34,7 +34,7 @@ class ToolConfig:
 @dataclass
 class EnvManagerConfig:
     """
-    Full configuration parsed from comfyui_env.toml.
+    Full configuration parsed from comfy-env.toml.
 
     Supports the v2 schema:
         [local.cuda]        - CUDA packages for host environment

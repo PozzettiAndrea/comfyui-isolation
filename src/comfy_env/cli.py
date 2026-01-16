@@ -47,7 +47,7 @@ def main(args: Optional[List[str]] = None) -> int:
     install_parser = subparsers.add_parser(
         "install",
         help="Install dependencies from config",
-        description="Install CUDA wheels and dependencies from comfyui_env.toml",
+        description="Install CUDA wheels and dependencies from comfy-env.toml",
     )
     install_parser.add_argument(
         "--config", "-c",
@@ -450,7 +450,7 @@ def cmd_list_packages(args) -> int:
     print("=" * 60)
     print()
     print("These packages can be installed without specifying wheel_sources.")
-    print("Just add them to your comfyui_env.toml:")
+    print("Just add them to your comfy-env.toml:")
     print()
     print("  [cuda]")
     print("  torch-scatter = \"2.1.2\"")

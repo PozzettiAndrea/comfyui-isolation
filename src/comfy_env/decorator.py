@@ -153,7 +153,7 @@ def _get_or_create_worker(config: WorkerConfig, log_fn: Callable):
             # Same Python - use TorchMPWorker (fast, zero-copy)
             from .workers import TorchMPWorker
             log_fn(f"Creating TorchMPWorker (same Python, zero-copy tensors)")
-            worker = TorchMPWorker(name=config.env_name)
+            worker = TorchMPWorker(name=config.env_name, sys_path=config.sys_path)
         else:
             # Different Python - use PersistentVenvWorker
             from .workers.venv import PersistentVenvWorker
@@ -368,6 +368,11 @@ def isolated(
 
                 # Get module name for import in worker
                 module_name = cls.__module__
+
+                # Handle ComfyUI's dynamic import which can set __module__ to a path
+                if module_name.startswith('/') or module_name.startswith('\\'):
+                    # Module name is a filesystem path - use the source file stem instead
+                    module_name = source_file.stem
 
                 # Call worker using appropriate method
                 if worker_config.python is None:
