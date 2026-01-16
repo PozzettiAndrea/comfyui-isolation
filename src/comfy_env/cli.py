@@ -234,6 +234,7 @@ def cmd_info(args) -> int:
 def cmd_resolve(args) -> int:
     """Handle resolve command."""
     from .resolver import RuntimeEnv, WheelResolver, parse_wheel_requirement
+    from .registry import PACKAGE_REGISTRY
     from .env.config_file import discover_env_config, load_env_from_file
 
     env = RuntimeEnv.detect()
@@ -270,17 +271,114 @@ def cmd_resolve(args) -> int:
             print(f"  {package}: No version specified, skipping")
             continue
 
+        pkg_lower = package.lower()
         try:
-            url = resolver.resolve(package, version, env, verify=args.verify)
-            status = "OK" if args.verify else "resolved"
-            print(f"  {package}=={version}: {status}")
-            print(f"    {url}")
+            # Check if package is in registry with github_release method
+            if pkg_lower in PACKAGE_REGISTRY:
+                registry_config = PACKAGE_REGISTRY[pkg_lower]
+                method = registry_config.get("method")
+
+                if method == "github_release":
+                    # Resolve URL from registry sources
+                    url = _resolve_github_release_url(package, version, env, registry_config)
+                    status = "OK" if args.verify else "resolved"
+                    print(f"  {package}=={version}: {status}")
+                    print(f"    {url}")
+                else:
+                    # For other methods, just show what method will be used
+                    print(f"  {package}=={version}: uses {method} method")
+                    if "index_url" in registry_config:
+                        index_url = _substitute_template(registry_config["index_url"], env)
+                        print(f"    index: {index_url}")
+                    elif "package_template" in registry_config:
+                        pkg_name = _substitute_template(registry_config["package_template"], env)
+                        print(f"    installs as: {pkg_name}")
+            else:
+                # Fall back to WheelResolver
+                url = resolver.resolve(package, version, env, verify=args.verify)
+                status = "OK" if args.verify else "resolved"
+                print(f"  {package}=={version}: {status}")
+                print(f"    {url}")
         except Exception as e:
             print(f"  {package}=={version}: FAILED")
-            print(f"    {e}")
+            _print_wheel_not_found_error(package, version, env, e)
             all_ok = False
 
     return 0 if all_ok else 1
+
+
+def _substitute_template(template: str, env) -> str:
+    """Substitute environment variables into a URL template."""
+    vars_dict = env.as_dict()
+    result = template
+    for key, value in vars_dict.items():
+        if value is not None:
+            result = result.replace(f"{{{key}}}", str(value))
+    return result
+
+
+def _resolve_github_release_url(package: str, version: str, env, config: dict) -> str:
+    """Resolve URL for github_release method packages."""
+    sources = config.get("sources", [])
+    if not sources:
+        raise ValueError(f"No sources configured for {package}")
+
+    # Build template variables
+    vars_dict = env.as_dict()
+    vars_dict["version"] = version
+    vars_dict["py_tag"] = f"cp{env.python_short}"
+    if env.cuda_version:
+        vars_dict["cuda_major"] = env.cuda_version.split(".")[0]
+
+    # Filter sources by platform
+    current_platform = env.platform_tag
+    compatible_sources = [
+        s for s in sources
+        if current_platform in s.get("platforms", [])
+    ]
+
+    if not compatible_sources:
+        available = set()
+        for s in sources:
+            available.update(s.get("platforms", []))
+        raise ValueError(
+            f"No {package} wheels for platform {current_platform}. "
+            f"Available: {', '.join(sorted(available))}"
+        )
+
+    # Return URL from first compatible source
+    source = compatible_sources[0]
+    url_template = source.get("url_template", "")
+    url = url_template
+    for key, value in vars_dict.items():
+        if value is not None:
+            url = url.replace(f"{{{key}}}", str(value))
+
+    return url
+
+
+def _print_wheel_not_found_error(package: str, version: str, env, error: Exception) -> None:
+    """Print a formatted error message for wheel not found."""
+    from .errors import WheelNotFoundError
+
+    if isinstance(error, WheelNotFoundError):
+        print(f"    CUDA wheel not found: {package}=={version}")
+        print()
+        print("+------------------------------------------------------------------+")
+        print("|  CUDA Wheel Not Found                                            |")
+        print("+------------------------------------------------------------------+")
+        print(f"|  Package:   {package}=={version:<46} |")
+        print(f"|  Requested: cu{env.cuda_short}-torch{env.torch_mm}-{env.python_short}-{env.platform_tag:<17} |")
+        print("|                                                                  |")
+        print(f"|  Reason: {error.reason:<54} |")
+        print("|                                                                  |")
+        print("|  Suggestions:                                                    |")
+        print(f"|    1. Check if wheel exists: comfy-env resolve {package:<15} |")
+        print(f"|    2. Build wheel locally: comfy-env build {package:<18} |")
+        print("|                                                                  |")
+        print("+------------------------------------------------------------------+")
+    else:
+        print(f"    {error}")
 
 
 def cmd_doctor(args) -> int:

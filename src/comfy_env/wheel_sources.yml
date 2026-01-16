@@ -131,8 +131,11 @@ packages:
         url_template: "https://github.com/Dao-AILab/flash-attention/releases/download/v{version}/flash_attn-{version}%2Bcu{cuda_major}torch{torch_dotted_mm}cxx11abiTRUE-{py_tag}-{py_tag}-linux_x86_64.whl"
         platforms: [linux_x86_64]
       - name: mjun0812
-        url_template: "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.2/flash_attn-{version}%2Bcu{cuda_short}torch{torch_dotted_mm}-{py_tag}-{py_tag}-linux_x86_64.whl"
+        url_template: "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.7/flash_attn-{version}%2Bcu{cuda_short}torch{torch_dotted_mm}-{py_tag}-{py_tag}-linux_x86_64.whl"
         platforms: [linux_x86_64]
+      - name: mjun0812-windows
+        url_template: "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.7/flash_attn-{version}%2Bcu{cuda_short}torch{torch_dotted_mm}-{py_tag}-{py_tag}-win_amd64.whl"
+        platforms: [win_amd64]
       - name: bdashore3
         url_template: "https://github.com/bdashore3/flash-attention/releases/download/v{version}/flash_attn-{version}%2Bcu{cuda_short}torch{torch_version}cxx11abiFALSE-{py_tag}-{py_tag}-win_amd64.whl"
         platforms: [win_amd64]

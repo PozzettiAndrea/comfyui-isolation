@@ -421,6 +421,7 @@ def _install_from_github_release(
                 url = url.replace(f"{{{key}}}", str(value))
 
         log(f"  Trying {source_name}: {package}=={version}...")
+        log(f"    Resolved wheel to: {url}")
 
         try:
             pip_cmd = _get_pip_command()
