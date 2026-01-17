@@ -106,6 +106,190 @@ def _worker_loop(queue_in, queue_out, sys_path_additions=None):
             break
 
 
+class PathBasedModuleFinder:
+    """
+    Meta path finder that handles ComfyUI's path-based module names.
+
+    ComfyUI uses full filesystem paths as module names for custom nodes.
+    This finder intercepts imports of such modules and loads them from disk.
+    """
+
+    def find_spec(self, fullname, path, target=None):
+        import importlib.util
+        import os
+
+        # Only handle path-based module names (starting with /)
+        if not fullname.startswith('/'):
+            return None
+
+        # Parse the module name to find base path and submodule parts
+        parts = fullname.split('.')
+        base_path = parts[0]
+        submodule_parts = parts[1:] if len(parts) > 1 else []
+
+        # Walk through parts to find where path ends and module begins
+        for i, part in enumerate(submodule_parts):
+            test_path = os.path.join(base_path, part)
+            if os.path.exists(test_path):
+                base_path = test_path
+            else:
+                # Remaining parts are module names
+                submodule_parts = submodule_parts[i:]
+                break
+        else:
+            # All parts were path components
+            submodule_parts = []
+
+        # Determine the file to load
+        if submodule_parts:
+            # We're importing a submodule
+            current_path = base_path
+            for part in submodule_parts[:-1]:
+                current_path = os.path.join(current_path, part)
+
+            submod = submodule_parts[-1]
+            submod_file = os.path.join(current_path, submod + '.py')
+            submod_pkg = os.path.join(current_path, submod, '__init__.py')
+
+            if os.path.exists(submod_file):
+                return importlib.util.spec_from_file_location(fullname, submod_file)
+            elif os.path.exists(submod_pkg):
+                return importlib.util.spec_from_file_location(
+                    fullname, submod_pkg,
+                    submodule_search_locations=[os.path.join(current_path, submod)]
+                )
+        else:
+            # Top-level path-based module
+            if os.path.isdir(base_path):
+                init_path = os.path.join(base_path, "__init__.py")
+                if os.path.exists(init_path):
+                    return importlib.util.spec_from_file_location(
+                        fullname, init_path,
+                        submodule_search_locations=[base_path]
+                    )
+            elif os.path.isfile(base_path):
+                return importlib.util.spec_from_file_location(fullname, base_path)
+
+        return None
+
+
+# Global flag to track if we've installed the finder
+_path_finder_installed = False
+
+
+def _ensure_path_finder_installed():
+    """Install the PathBasedModuleFinder if not already installed."""
+    import sys
+    global _path_finder_installed
+    if not _path_finder_installed:
+        sys.meta_path.insert(0, PathBasedModuleFinder())
+        _path_finder_installed = True
+        logger.debug("[comfy_env] Installed PathBasedModuleFinder for path-based module names")
+
+
+def _load_path_based_module(module_name: str):
+    """
+    Load a module that has a filesystem path as its name.
+
+    ComfyUI uses full filesystem paths as module names for custom nodes.
+    This function handles that case by using file-based imports.
+    """
+    import importlib.util
+    import os
+    import sys
+
+    # Check if it's already in sys.modules
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+
+    # Check if module_name contains submodule parts (e.g., "/path/to/pkg.submod.subsubmod")
+    # In this case, we need to load the parent packages first
+    if '.' in module_name:
+        parts = module_name.split('.')
+        # Find where the path ends and module parts begin
+        # The path part won't exist as a directory when combined with module parts
+        base_path = parts[0]
+        submodule_parts = []
+
+        for i, part in enumerate(parts[1:], 1):
+            test_path = os.path.join(base_path, part)
+            if os.path.exists(test_path):
+                base_path = test_path
+            else:
+                # This and remaining parts are module names, not path components
+                submodule_parts = parts[i:]
+                break
+
+        if submodule_parts:
+            # Load parent package first
+            parent_module = _load_path_based_module(base_path)
+
+            # Now load submodules
+            current_module = parent_module
+            current_name = base_path
+            for submod in submodule_parts:
+                current_name = f"{current_name}.{submod}"
+                if current_name in sys.modules:
+                    current_module = sys.modules[current_name]
+                else:
+                    # Try to import as attribute or load from file
+                    if hasattr(current_module, submod):
+                        current_module = getattr(current_module, submod)
+                    else:
+                        # Try to load the submodule file
+                        if hasattr(current_module, '__path__'):
+                            for parent_path in current_module.__path__:
+                                submod_file = os.path.join(parent_path, submod + '.py')
+                                submod_pkg = os.path.join(parent_path, submod, '__init__.py')
+                                if os.path.exists(submod_file):
+                                    spec = importlib.util.spec_from_file_location(current_name, submod_file)
+                                    current_module = importlib.util.module_from_spec(spec)
+                                    current_module.__package__ = f"{base_path}.{'.'.join(submodule_parts[:-1])}" if len(submodule_parts) > 1 else base_path
+                                    sys.modules[current_name] = current_module
+                                    spec.loader.exec_module(current_module)
+                                    break
+                                elif os.path.exists(submod_pkg):
+                                    spec = importlib.util.spec_from_file_location(current_name, submod_pkg,
+                                        submodule_search_locations=[os.path.dirname(submod_pkg)])
+                                    current_module = importlib.util.module_from_spec(spec)
+                                    sys.modules[current_name] = current_module
+                                    spec.loader.exec_module(current_module)
+                                    break
+                        else:
+                            raise ModuleNotFoundError(f"Cannot find submodule {submod} in {current_name}")
+            return current_module
+
+    # Simple path-based module (no submodule parts)
+    if os.path.isdir(module_name):
+        init_path = os.path.join(module_name, "__init__.py")
+        submodule_search_locations = [module_name]
+    else:
+        init_path = module_name
+        submodule_search_locations = None
+
+    if not os.path.exists(init_path):
+        raise ModuleNotFoundError(f"Cannot find module at path: {module_name}")
+
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        init_path,
+        submodule_search_locations=submodule_search_locations
+    )
+    module = importlib.util.module_from_spec(spec)
+
+    # Set up package attributes for relative imports
+    if os.path.isdir(module_name):
+        module.__path__ = [module_name]
+        module.__package__ = module_name
+    else:
+        module.__package__ = module_name.rsplit('.', 1)[0] if '.' in module_name else ''
+
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+
+    return module
+
+
 def _execute_method_call(module_name: str, class_name: str, method_name: str,
                          self_state: dict, kwargs: dict) -> Any:
     """
@@ -114,9 +298,28 @@ def _execute_method_call(module_name: str, class_name: str, method_name: str,
     This function imports the class fresh and calls the original (un-decorated) method.
     """
     import importlib
+    import os
+    import sys
 
     # Import the module
-    module = importlib.import_module(module_name)
+    logger.debug(f"Attempting to import module_name={module_name}")
+
+    # Check if module_name is a filesystem path (ComfyUI uses paths as module names)
+    # This happens because ComfyUI's load_custom_node uses the full path as sys_module_name
+    if module_name.startswith('/') or (os.sep in module_name and not module_name.startswith('.')):
+        # Check if the base path exists to confirm it's a path-based module
+        base_path = module_name.split('.')[0] if '.' in module_name else module_name
+        if os.path.exists(base_path):
+            logger.debug(f"Detected path-based module name, using file-based import")
+            # Install the meta path finder to handle relative imports within the package
+            _ensure_path_finder_installed()
+            module = _load_path_based_module(module_name)
+        else:
+            # Doesn't look like a valid path, try standard import
+            module = importlib.import_module(module_name)
+    else:
+        # Standard module name - use importlib.import_module
+        module = importlib.import_module(module_name)
     cls = getattr(module, class_name)
 
     # Create instance with proper __slots__ handling

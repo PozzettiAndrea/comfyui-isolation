@@ -367,12 +367,9 @@ def isolated(
                     call_kwargs = {k: _clone_tensor_if_needed(v) for k, v in call_kwargs.items()}
 
                 # Get module name for import in worker
+                # Note: ComfyUI uses full filesystem paths as module names for custom nodes.
+                # The worker's _execute_method_call handles this by using file-based imports.
                 module_name = cls.__module__
-
-                # Handle ComfyUI's dynamic import which can set __module__ to a path
-                if module_name.startswith('/') or module_name.startswith('\\'):
-                    # Module name is a filesystem path - use the source file stem instead
-                    module_name = source_file.stem
 
                 # Call worker using appropriate method
                 if worker_config.python is None:
