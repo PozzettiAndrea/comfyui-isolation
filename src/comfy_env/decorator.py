@@ -113,6 +113,31 @@ def _clone_tensor_if_needed(obj: Any, smart_clone: bool = True) -> Any:
     return obj
 
 
+def _find_node_package_dir(source_file: Path) -> Path:
+    """
+    Find the node package root directory by searching for comfy-env.toml.
+
+    Walks up from the source file's directory until it finds a config file,
+    or falls back to heuristics if not found.
+    """
+    from .env.config_file import CONFIG_FILE_NAMES
+
+    current = source_file.parent
+
+    # Walk up the directory tree looking for config file
+    while current != current.parent:  # Stop at filesystem root
+        for config_name in CONFIG_FILE_NAMES:
+            if (current / config_name).exists():
+                return current
+        current = current.parent
+
+    # Fallback: use old heuristic if no config found
+    node_dir = source_file.parent
+    if node_dir.name == "nodes":
+        return node_dir.parent
+    return node_dir
+
+
 # ---------------------------------------------------------------------------
 # Worker Management
 # ---------------------------------------------------------------------------
@@ -262,10 +287,7 @@ def isolated(
         # Get source file info for sys.path setup
         source_file = Path(inspect.getfile(cls))
         node_dir = source_file.parent
-        if node_dir.name == "nodes":
-            node_package_dir = node_dir.parent
-        else:
-            node_package_dir = node_dir
+        node_package_dir = _find_node_package_dir(source_file)
 
         # Build sys.path for worker
         sys_path_additions = [str(node_dir)]
