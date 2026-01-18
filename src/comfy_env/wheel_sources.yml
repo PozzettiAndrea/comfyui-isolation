@@ -101,6 +101,11 @@ packages:
     index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     description: GPU-accelerated Non-Maximum Suppression
 
+  lietorch:
+    method: index
+    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    description: Lie group operations for PyTorch (DPVO dependency)
+
   # ===========================================================================
   # spconv - PyPI with CUDA-versioned package names
   # ===========================================================================
