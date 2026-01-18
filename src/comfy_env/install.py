@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
 
-from .env.config import IsolatedEnv, NodeReq, SystemConfig
+from .env.config import IsolatedEnv, LocalConfig, NodeReq, SystemConfig
 from .env.config_file import load_config, discover_config
 from .env.manager import IsolatedEnvManager
 from .errors import CUDANotFoundError, DependencyError, InstallError, WheelNotFoundError
@@ -254,6 +254,9 @@ def install(
         return _install_isolated(env_config, node_dir, log, dry_run)
     elif env_config:
         return _install_inplace(env_config, node_dir, log, dry_run, verify_wheels)
+    elif full_config.has_local:
+        # Handle [local.cuda] and [local.packages] without isolated env
+        return _install_local(full_config.local, node_dir, log, dry_run)
     else:
         return True
 
@@ -350,6 +353,63 @@ def _install_inplace(
         _pip_install(regular_packages, no_deps=False, log=log)
 
     log("\nInstallation complete!")
+    return True
+
+
+def _install_local(
+    local_config: LocalConfig,
+    node_dir: Path,
+    log: Callable[[str], None],
+    dry_run: bool,
+) -> bool:
+    """Install local packages into current environment (no isolated venv)."""
+    log("Installing local packages into host environment")
+
+    # Install MSVC runtime on Windows (required for CUDA/PyTorch native extensions)
+    if sys.platform == "win32":
+        log("Installing MSVC runtime for Windows...")
+        if not dry_run:
+            _pip_install(["msvc-runtime"], no_deps=False, log=log)
+
+    # Detect runtime environment
+    env = RuntimeEnv.detect()
+    log(f"Detected environment: {env}")
+
+    # Check CUDA requirement
+    if not env.cuda_version and local_config.cuda_packages:
+        raise CUDANotFoundError(package=", ".join(local_config.cuda_packages.keys()))
+
+    # Convert cuda_packages dict to list of specs
+    cuda_packages = []
+    for pkg, ver in local_config.cuda_packages.items():
+        if ver:
+            cuda_packages.append(f"{pkg}=={ver}")
+        else:
+            cuda_packages.append(pkg)
+
+    if dry_run:
+        log("\nDry run - would install:")
+        for pkg in cuda_packages:
+            log(f"  {pkg}")
+        if local_config.requirements:
+            log("  Regular packages:")
+            for pkg in local_config.requirements:
+                log(f"    {pkg}")
+        return True
+
+    # Install CUDA packages
+    if cuda_packages:
+        log(f"\nInstalling {len(cuda_packages)} CUDA packages...")
+        for req in cuda_packages:
+            package, version = parse_wheel_requirement(req)
+            _install_cuda_package(package, version, env, [], log)
+
+    # Install regular packages
+    if local_config.requirements:
+        log(f"\nInstalling {len(local_config.requirements)} regular packages...")
+        _pip_install(local_config.requirements, no_deps=False, log=log)
+
+    log("\nLocal installation complete!")
     return True
 
 
