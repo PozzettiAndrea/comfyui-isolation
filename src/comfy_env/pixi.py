@@ -274,6 +274,35 @@ def create_pixi_toml(
     return pixi_toml_path
 
 
+def clean_pixi_artifacts(
+    node_dir: Path,
+    log: Callable[[str], None] = print,
+) -> None:
+    """
+    Remove previous pixi installation artifacts.
+
+    This ensures a clean state before generating a new pixi.toml,
+    preventing stale lock files or cached environments from causing conflicts.
+
+    Args:
+        node_dir: Directory containing the pixi artifacts.
+        log: Logging callback.
+    """
+    pixi_toml = node_dir / "pixi.toml"
+    pixi_lock = node_dir / "pixi.lock"
+    pixi_dir = node_dir / ".pixi"
+
+    if pixi_toml.exists():
+        pixi_toml.unlink()
+        log("  Removed previous pixi.toml")
+    if pixi_lock.exists():
+        pixi_lock.unlink()
+        log("  Removed previous pixi.lock")
+    if pixi_dir.exists():
+        shutil.rmtree(pixi_dir)
+        log("  Removed previous .pixi/ directory")
+
+
 def pixi_install(
     env_config: IsolatedEnv,
     node_dir: Path,
@@ -284,9 +313,10 @@ def pixi_install(
     Install conda and pip packages using pixi.
 
     This is the main entry point for pixi-based installation. It:
-    1. Ensures pixi is installed
-    2. Generates pixi.toml from the config
-    3. Runs `pixi install` to install all dependencies
+    1. Cleans previous pixi artifacts
+    2. Ensures pixi is installed
+    3. Generates pixi.toml from the config
+    4. Runs `pixi install` to install all dependencies
 
     Args:
         env_config: The isolated environment configuration.
@@ -304,6 +334,7 @@ def pixi_install(
 
     if dry_run:
         log("Dry run - would:")
+        log(f"  - Clean previous pixi artifacts")
         log(f"  - Ensure pixi is installed")
         log(f"  - Generate pixi.toml in {node_dir}")
         if env_config.conda:
@@ -311,6 +342,9 @@ def pixi_install(
         if env_config.requirements:
             log(f"  - Install {len(env_config.requirements)} pip packages")
         return True
+
+    # Clean previous pixi artifacts
+    clean_pixi_artifacts(node_dir, log)
 
     # Ensure pixi is installed
     pixi_path = ensure_pixi(log=log)
